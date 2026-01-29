@@ -27,11 +27,11 @@ QUEUE_DIR = Path("/root/job_bot/queue")
 OUTPUT_DIR = Path("/root/output")
 COOKIES_FILE = Path("/root/job_bot/agent/cookies.json")
 
-# Bright Data residential proxy settings
+# Bright Data residential proxy settings from environment
 BRIGHT_DATA_PROXY = ProxySettings(
     server="http://brd.superproxy.io:33335",
-    username="REDACTED_BRIGHTDATA_CREDENTIALS",
-    password="REDACTED_PASSWORD",
+    username=os.getenv("BRIGHT_DATA_USERNAME", ""),
+    password=os.getenv("BRIGHT_DATA_PASSWORD", ""),
 )
 
 # Applicant info

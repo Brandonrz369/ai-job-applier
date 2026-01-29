@@ -4,6 +4,7 @@ Both test scripts and production applier use this
 """
 from pathlib import Path
 import json
+import os
 
 # ============ PATHS ============
 BASE_DIR = Path("/root/job_bot")
@@ -12,13 +13,14 @@ QUEUE_DIR = BASE_DIR / "queue"
 LOGS_DIR = BASE_DIR / "logs"
 
 # ============ BROWSER ============
-BROWSER_WS = "wss://REDACTED_BRIGHTDATA_CREDENTIALS:REDACTED_PASSWORD@brd.superproxy.io:9222"
+# Bright Data credentials from environment
+BROWSER_WS = os.getenv("BRIGHT_DATA_WS", "")
 
 # ============ APPLICANT INFO ============
 APPLICANT = {
     "name": "Brandon Ruiz",
     "email": "brandonlruiz98@gmail.com",
-    "password": "REDACTED_PASSWORD",
+    "password": os.getenv("INDEED_PASSWORD", ""),
     "phone": "775-530-8234",
     "location": "Anaheim, CA",
     "linkedin": "linkedin.com/in/yourusername",

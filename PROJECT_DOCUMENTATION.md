@@ -94,7 +94,7 @@
 | Property | Value |
 |----------|-------|
 | Zone | `jobbot` |
-| WebSocket URL | `wss://REDACTED_BRIGHTDATA_CREDENTIALS:REDACTED_PASSWORD@brd.superproxy.io:9222` |
+| WebSocket URL | `wss://brd-customer-$CUSTOMER_ID-zone-$ZONE:$PASSWORD@brd.superproxy.io:9222` |
 | Credit | $97 remaining |
 | Cost | ~$0.08 per browser minute |
 | Estimated capacity | ~1,200 applications |
@@ -132,9 +132,9 @@ OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 | Property | Value |
 |----------|-------|
-| Email | `matwukagw527292@gmail.com` |
-| Gmail Password | `REDACTED_PASSWORD` |
-| Indeed Password | `REDACTED_PASSWORD` |
+| Email | Set in `.env` as `INDEED_EMAIL` |
+| Gmail Password | Set in `.env` as `GMAIL_PASSWORD` |
+| Indeed Password | Set in `.env` as `INDEED_PASSWORD` |
 | Phone | `714-598-3651` |
 | Name | `Brandon Ruiz` |
 | Location | `Long Beach, CA` |
@@ -144,15 +144,14 @@ OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 ### 3.3 Resume
 
-**Location:** `/root/output/ExecutivePlacements_com_38_Resume.pdf`
+**Location:** Dynamically selected from `/root/output/`
 
-### 3.4 Bright Data Credentials (embedded in WebSocket URL)
+### 3.4 Bright Data Credentials
 
-| Property | Value |
-|----------|-------|
-| Customer ID | `hl_1ee7d566` |
-| Zone | `jobbot` |
-| Password | `REDACTED_PASSWORD` |
+Set in `.env`:
+- `BRIGHT_DATA_CUSTOMER_ID`
+- `BRIGHT_DATA_ZONE`
+- `BRIGHT_DATA_PASSWORD`
 
 ---
 
@@ -478,14 +477,14 @@ You: *wake up to interview requests*
 ```python
 # Lines 22-29: Bright Data config
 BRIGHT_DATA = {
-    "ws": "wss://REDACTED_BRIGHTDATA_CREDENTIALS:REDACTED_PASSWORD@brd.superproxy.io:9222",
+    "ws": "wss://brd-customer-$CUSTOMER_ID-zone-$ZONE:$PASSWORD@brd.superproxy.io:9222",
 }
 
 # Lines 31-45: Account credentials
 ACCOUNTS = {
     "matwukagw527292@gmail.com": {
-        "gmail_password": "REDACTED_PASSWORD",
-        "indeed_password": "REDACTED_PASSWORD",
+        "gmail_password": "$GMAIL_PASSWORD",
+        "indeed_password": "$INDEED_PASSWORD",
         "name": "Brandon Ruiz",
         "phone": "714-598-3651",
         ...
@@ -515,8 +514,8 @@ ACCOUNTS = {
     
     # Add new account:
     "newburner@gmail.com": {
-        "gmail_password": "password123",
-        "indeed_password": "password123", 
+        "gmail_password": "$GMAIL_PASSWORD",
+        "indeed_password": "$INDEED_PASSWORD", 
         "name": "John Smith",
         "phone": "555-123-4567",
         "location": "New York, NY",
