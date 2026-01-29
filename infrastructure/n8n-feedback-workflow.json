@@ -1,0 +1,48 @@
+{
+  "name": "Feedback Tracker",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "feedback",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "feedback-webhook",
+      "name": "Feedback Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Update stats when you get a response/interview\nconst fs = require('fs');\nconst counterFile = '/output/.counter.json';\nconst feedbackFile = '/output/.feedback.json';\n\n// Load current stats\nlet counter = { total: 0, remote: 0, local: 0, responses: 0, interviews: 0 };\ntry {\n  counter = JSON.parse(fs.readFileSync(counterFile, 'utf8'));\n} catch (e) {}\n\nlet feedback = { successful_companies: [], response_rate_history: [] };\ntry {\n  feedback = JSON.parse(fs.readFileSync(feedbackFile, 'utf8'));\n} catch (e) {}\n\n// Get input\nconst input = $input.all()[0].json.body || $input.all()[0].json;\nconst responseType = input.type || 'response'; // 'response' or 'interview'\nconst company = input.company || 'Unknown';\nconst notes = input.notes || '';\n\n// Update counters\ncounter.responses += 1;\nif (responseType === 'interview') {\n  counter.interviews += 1;\n}\n\n// Track which companies responded (for self-improvement)\nfeedback.successful_companies.push({\n  company: company,\n  type: responseType,\n  date: new Date().toISOString(),\n  notes: notes\n});\n\n// Calculate response rate\nconst responseRate = counter.total > 0 ? (counter.responses / counter.total * 100).toFixed(1) : 0;\nfeedback.response_rate_history.push({\n  date: new Date().toISOString(),\n  rate: parseFloat(responseRate),\n  total: counter.total,\n  responses: counter.responses\n});\n\n// Save\nfs.writeFileSync(counterFile, JSON.stringify(counter, null, 2));\nfs.writeFileSync(feedbackFile, JSON.stringify(feedback, null, 2));\n\nreturn [{\n  json: {\n    success: true,\n    message: `Recorded ${responseType} from ${company}`,\n    current_stats: {\n      total_applications: counter.total,\n      responses: counter.responses,\n      interviews: counter.interviews,\n      response_rate: `${responseRate}%`\n    }\n  }\n}];"
+      },
+      "id": "update-feedback",
+      "name": "Update Feedback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}"
+      },
+      "id": "respond-feedback",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [440, 300]
+    }
+  ],
+  "connections": {
+    "Feedback Webhook": {
+      "main": [[{ "node": "Update Feedback", "type": "main", "index": 0 }]]
+    },
+    "Update Feedback": {
+      "main": [[{ "node": "Respond", "type": "main", "index": 0 }]]
+    }
+  }
+}

@@ -1,0 +1,326 @@
+{
+  "id": "Solg37QNzaVG3jTv",
+  "versionId": "e1688c7e-07f7-4603-82de-d9fe54936e4f",
+  "name": "Job Application Factory v3 - Complete",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "incoming-job",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Application Counter & Stats Tracker (using workflow staticData)\n// Get or initialize counter from workflow staticData\nlet counter = $getWorkflowStaticData('global').counter || { total: 0, remote: 0, local: 0, responses: 0, interviews: 0 };\n\n// Increment counter\ncounter.total += 1;\n\n// Check if remote\nconst jobData = $input.all()[0].json.body || $input.all()[0].json;\nconst textToCheck = `${jobData.title || ''} ${jobData.description || ''} ${jobData.location || ''}`.toLowerCase();\nconst isRemote = /remote|work from home|wfh|anywhere|telecommute|hybrid/.test(textToCheck);\n\nif (isRemote) {\n  counter.remote += 1;\n} else {\n  counter.local += 1;\n}\n\n// Calculate response rate for prompt optimization\nconst responseRate = counter.total > 0 ? (counter.responses / counter.total * 100).toFixed(1) : 0;\n\n// Save counter to workflow staticData\n$getWorkflowStaticData('global').counter = counter;\n\n// Use timestamp-based unique ID for filename\nconst appNum = Date.now();\n\nreturn [{\n  json: {\n    title: jobData.title || 'Unknown Position',\n    company: jobData.company || 'Unknown Company',\n    description: jobData.description || '',\n    url: jobData.url || '',\n    location: jobData.location || '',\n    application_number: appNum,\n    is_remote: isRemote,\n    stats: counter,\n    feedback: {},\n    response_rate: responseRate,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "counter-node",
+      "name": "Counter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googlePalmApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "key",
+              "value": "={{ $credentials.apiKey }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"systemInstruction\": {\n    \"parts\": [{\n      \"text\": \"You are an expert Resume Writer. Generate a COMPLETE, PROFESSIONAL, ATS-OPTIMIZED HTML RESUME.\\n\\n=== CANDIDATE MASTER DATA ===\\n\\nNAME: Brandon Ruiz\\nLOCATION: Long Beach, CA\\nPHONE: 775-530-8234\\nEMAIL: brandonlruiz98@gmail.com\\n\\n=== PROFESSIONAL SUMMARY (TAILOR THIS) ===\\nHands-on IT support tech with several years of help desk/desktop support experience plus recent experience running LB Computer Help, a small MSP/computer repair business in Long Beach. Supported a small on-prem Windows environment at Marina Shipyard (Active Directory/DNS on Windows Server, on-prem web and mail services, Veeam backups, Fortinet FortiGate firewall, and multiple Windows workstations) while handling daily user support. Built and supported a client base of 130+ customers and approximately $50K in net sales within about seven months.\\n\\n=== CORE SKILLS (PRIORITIZE MATCHES) ===\\n• Windows & Servers: Windows 10/11 troubleshooting, basic Windows Server administration, Active Directory user and computer management, account lockout/password reset support, workstation domain joins\\n• Networking & Security: Basic TCP/IP and DNS concepts, small-business router/switch configuration, Fortinet FortiGate firewall rule/NAT changes and basic VPN/access provisioning\\n• Backup & Infrastructure: Veeam-based backups for Windows Server, checking and troubleshooting job status, simple test restores and file restores\\n• End-User Support: Desktop and laptop troubleshooting, software installs/updates, PC upgrades, printer and peripheral setup, Wi-Fi troubleshooting, remote support tools\\n• Business & Operations: Customer communication, intake and triage, scheduling, quoting, invoicing, basic bookkeeping, documentation and checklists\\n• Currently learning: AWS cloud fundamentals (preparing for AWS Cloud Practitioner certification)\\n\\n=== PROFESSIONAL EXPERIENCE (INCLUDE ALL) ===\\n\\n1. Owner / IT Support Technician\\n   LB Computer Help – Long Beach, CA | Apr 2024 – Present\\n   • Founded and ran LB Computer Help, a residential and small-business IT support/MSP operation\\n   • Built a client base of 130+ customers and generated roughly $50K in net sales in about seven months\\n   • Key client: Marina Shipyard — managed complete on-prem environment:\\n     - AD/Windows Server/DNS: Managed user/computer accounts, group memberships, password resets, workstation joins, basic Group Policy changes on Windows Server with Veeam services; maintained internal DNS records\\n     - Web & mail (on-prem): Kept on-prem web and mail services reachable and stable; handled account changes, mailbox issues, client connectivity, routine troubleshooting\\n     - Backups – Veeam: Monitored and maintained Veeam backup jobs for servers/critical data; verified job status and performed test/file restores as needed\\n     - Fortinet FortiGate: Worked with FortiGate firewall to adjust rules/objects and basic remote-access configurations; made routine policy updates\\n     - Workstations & users: Provided everyday help desk support (lockouts, printer issues, app errors), built and upgraded PCs, performed OS reloads and cleanup, documented changes\\n   • For other clients: malware cleanup, OS reinstalls, performance tuning, Wi-Fi/router troubleshooting, printer installs, network setups, data backup/restore\\n   • Managed business operations: intake, scheduling, quoting, invoicing, bookkeeping, documentation\\n\\n2. IT Specialist\\n   Geeks-On-Site – Anaheim, CA | Jun 2021 – Oct 2021\\n   • Visited residential and small-business customers on-site for software and hardware troubleshooting\\n   • Performed software updates, OS cleanups and reinstalls, basic hardware replacements (drives, RAM, peripherals)\\n   • Worked with customers of all ages and technical levels with clear explanations and patient support\\n\\n3. IT Consultant\\n   JFG Systems – Reno, NV | Feb 2019 – Mar 2019\\n   • Assisted with small IT audits and basic assessments of business clients' environments\\n   • Helped identify workstation and simple network issues and escalated complex problems\\n   • Interacted directly with business owners and staff to understand needs and constraints\\n\\n4. IT Support Specialist\\n   Fusion Contact Centers – Reno, NV | Aug 2016 – Aug 2017\\n   • Provided first-line technical support in contact center (password resets, software issues, workstation problems)\\n   • Helped maintain stable desktop environment and escalated recurring/complex issues\\n   • Assisted with documenting common fixes and basic procedures\\n\\n=== ADDITIONAL EXPERIENCE ===\\n• Supervisor - LAZ Parking, Anaheim, CA (Nov 2022 – Current)\\n• Driver - DoorDash (Oct 2021 – Current)\\n• Warehouse/Machine Operator - Randstad/Innovation Bakery, Valeo (2019-2022)\\n\\n=== EDUCATION ===\\n• Truckee Meadows Community College – Reno, NV (Coursework toward associate degree, ~1 year)\\n• CCNN Trade School – Sparks, NV (IT Specialist program including networking and system administration, ~1 year)\\n\\n=== AWARDS/COMMUNITY ===\\n• XDA Developers – Senior Member, Recognized Contributor\\n\\n=== INSTRUCTIONS ===\\n1. READ the job description carefully\\n2. IDENTIFY the top 5-7 keywords/skills they want\\n3. REWRITE the Professional Summary to highlight matching experience\\n4. REORDER skills section to put matching skills FIRST\\n5. For each job experience, BOLD the bullet points most relevant to this role\\n6. If they want something I don't have, highlight the CLOSEST experience\\n7. Output COMPLETE HTML resume with inline CSS\\n8. Use professional styling: #2c3e50 headers, clean fonts, proper spacing\\n9. NO markdown syntax - use HTML tags only (<strong> for bold, <em> for italic)\\n10. NO code blocks, NO explanations, NO placeholder text like [mention X]\\n11. Include ALL sections - this must be a COMPLETE resume\"\n    }]\n  },\n  \"contents\": [{\n    \"role\": \"user\",\n    \"parts\": [{\n      \"text\": \"Generate my COMPLETE tailored resume for this job:\\n\\nCOMPANY: {{ $json.company }}\\nPOSITION: {{ $json.title }}\\nLOCATION: {{ $json.location }}\\n\\nJOB DESCRIPTION:\\n{{ $json.description }}\\n\\nAPPLICATION #{{ $json.application_number }}\\n\\nOutput the complete HTML resume now.\"\n    }]\n  }],\n  \"generationConfig\": {\n    \"temperature\": 0.7,\n    \"topP\": 0.95,\n    \"topK\": 40,\n    \"maxOutputTokens\": 8192\n  }\n}",
+        "options": {}
+      },
+      "id": "resume-writer",
+      "name": "Resume Writer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 200],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "9iggAPGjr7vGIe2T",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googlePalmApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "key",
+              "value": "={{ $credentials.apiKey }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"systemInstruction\": {\n    \"parts\": [{\n      \"text\": \"You are an expert Cover Letter Writer. Generate a COMPLETE, COMPELLING, HUMAN-SOUNDING cover letter in HTML.\\n\\n=== CANDIDATE INFO ===\\nNAME: Brandon Ruiz\\nLOCATION: Long Beach, CA\\nPHONE: 775-530-8234\\nEMAIL: brandonlruiz98@gmail.com\\n\\n=== MY STORY ===\\nI ran LB Computer Help, a small MSP in Long Beach. My wife and I started it from our apartment in the Magnolia area and grew it to a dedicated office. In about seven months, I supported 130+ customers and generated ~$50K in net sales.\\n\\nMy key client was Marina Shipyard, where I was their main IT contact. I managed their complete on-prem Windows environment: Active Directory/DNS on Windows Server, on-prem web and mail services, Veeam backups, a Fortinet FortiGate firewall, and a fleet of Windows workstations.\\n\\nDay to day at Marina Shipyard meant: managing user accounts, handling password resets and lockouts, keeping DNS and firewall policies aligned with business needs, monitoring Veeam backup jobs, and dealing with common user issues like new PC setups, upgrades, printer problems, and application errors.\\n\\nBefore LB Computer Help, I gained IT support experience at Fusion Contact Centers, JFG Systems, and Geeks-On-Site - solid help desk foundation. The MSP work added responsibility for servers, backups, and firewall in a live production environment.\\n\\nI'm currently studying for AWS Cloud Practitioner certification.\\n\\nI'm shifting from running my business full-time to seeking a stable, full-time role where I can keep growing technically. I'll continue supporting a small number of existing clients on evenings/weekends, carefully avoiding any conflict of interest.\\n\\n=== THE META-PLAY (IMPORTANT) ===\\nThis application was generated by an autonomous job agent I built using n8n, Gemini, and Python. This is NOT a weakness - it's a STRENGTH. It demonstrates:\\n- Automation skills\\n- Initiative and resourcefulness\\n- Ability to build systems that work while I sleep\\n- Exactly the kind of thinking that makes a great IT professional\\n\\nInclude this naturally in the closing paragraph. Make it confident, not apologetic.\\n\\n=== TONE ===\\n- Confident but not arrogant\\n- Human and warm, not robotic\\n- Show hunger to learn and grow\\n- Emphasize accountability from running a business\\n- If slightly underqualified for something, acknowledge briefly then pivot to 'hungry and trainable'\\n- Sound like a real person wrote this, not AI\\n\\n=== STRUCTURE ===\\n1. Opening: Hook them - why this specific company/role interests me\\n2. Middle: Connect my Marina Shipyard experience to their needs\\n3. Middle: Show I understand their challenges\\n4. Closing: The meta-play about the job agent + call to action\\n\\n=== OUTPUT REQUIREMENTS ===\\n- Complete HTML with inline CSS\\n- Professional letterhead style\\n- Include today's date, their company name, proper formatting\\n- One page maximum\\n- NO markdown syntax - use HTML tags only (<strong> for bold, <em> for italic)\\n- NO code blocks, NO explanations\\n- CRITICAL: NO placeholder text like [mention X] or [insert Y] - either include real specific content or omit the sentence entirely\\n- Just the HTML letter\"\n    }]\n  },\n  \"contents\": [{\n    \"role\": \"user\",\n    \"parts\": [{\n      \"text\": \"Generate my COMPLETE cover letter for:\\n\\nCOMPANY: {{ $json.company }}\\nPOSITION: {{ $json.title }}\\nLOCATION: {{ $json.location }}\\n\\nJOB DESCRIPTION:\\n{{ $json.description }}\\n\\nThis is APPLICATION #{{ $json.application_number }} from my job agent.\\n\\nInclude in closing: 'Full transparency: This application was generated by an autonomous job agent I built. You are employer #{{ $json.application_number }}. I would welcome the chance to demonstrate both my IT support skills and my automation capabilities.'\\n\\nOutput the complete HTML cover letter now.\"\n    }]\n  }],\n  \"generationConfig\": {\n    \"temperature\": 0.8,\n    \"topP\": 0.95,\n    \"topK\": 40,\n    \"maxOutputTokens\": 4096\n  }\n}",
+        "options": {}
+      },
+      "id": "cover-writer",
+      "name": "Cover Letter Writer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 400],
+      "credentials": {
+        "googlePalmApi": {
+          "id": "9iggAPGjr7vGIe2T",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Parse Gemini response for Resume\nlet response = $input.first().json;\n\n// If response is a string, parse it as JSON\nif (typeof response === 'string') {\n  response = JSON.parse(response);\n}\n\n// If the whole response is nested under 'data' or 'body'\nif (response.data) response = response.data;\nif (response.body && typeof response.body === 'object') response = response.body;\n\n// Extract HTML from Gemini response structure\nlet html = response?.candidates?.[0]?.content?.parts?.[0]?.text;\n\n// If still not found, try to find it in the response\nif (!html && response.text) html = response.text;\nif (!html && typeof response === 'string') html = response;\n\nif (!html) {\n  throw new Error('No HTML found in Gemini response. Response keys: ' + Object.keys(response || {}).join(', '));\n}\n\nreturn [{ json: { html } }];"
+      },
+      "id": "parse-resume-response",
+      "name": "Parse Resume Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [550, 200]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Parse Gemini response for Cover Letter\nlet response = $input.first().json;\n\n// If response is a string, parse it as JSON\nif (typeof response === 'string') {\n  response = JSON.parse(response);\n}\n\n// If the whole response is nested under 'data' or 'body'\nif (response.data) response = response.data;\nif (response.body && typeof response.body === 'object') response = response.body;\n\n// Extract HTML from Gemini response structure\nlet html = response?.candidates?.[0]?.content?.parts?.[0]?.text;\n\n// If still not found, try to find it in the response\nif (!html && response.text) html = response.text;\nif (!html && typeof response === 'string') html = response;\n\nif (!html) {\n  throw new Error('No HTML found in Gemini response. Response keys: ' + Object.keys(response || {}).join(', '));\n}\n\nreturn [{ json: { html } }];"
+      },
+      "id": "parse-cover-response",
+      "name": "Parse Cover Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [550, 400]
+    },
+    {
+      "parameters": {
+        "mode": "append"
+      },
+      "id": "wait-for-both",
+      "name": "Wait for Both",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Extract HTML from parsed Gemini responses\nconst resumeResponse = $('Parse Resume Response').first().json;\nconst coverResponse = $('Parse Cover Response').first().json;\nconst jobData = $('Counter').first().json;\n\n// Get the extracted HTML\nlet resumeHtml = resumeResponse.html;\nlet coverHtml = coverResponse.html;\n\n// Function to clean JSON wrapper if present\nfunction cleanJsonWrapper(text) {\n  if (!text) return text;\n  // If it looks like JSON with candidates, extract the text\n  if (text.includes('\"candidates\"') && text.includes('\"parts\"')) {\n    try {\n      const parsed = JSON.parse(text);\n      if (parsed?.candidates?.[0]?.content?.parts?.[0]?.text) {\n        return parsed.candidates[0].content.parts[0].text;\n      }\n    } catch (e) {\n      // Try regex extraction as fallback\n      const match = text.match(/\"text\"\\s*:\\s*\"([\\s\\S]*?)\"\\s*}\\s*\\]\\s*}\\s*}\\s*\\]/);\n      if (match) return match[1].replace(/\\\\n/g, '\\n').replace(/\\\\\"/g, '\"');\n    }\n  }\n  // Remove any JSON prefix/suffix that might have leaked through\n  text = text.replace(/^\\{\"candidates\".*?\"text\"\\s*:\\s*\"/s, '');\n  text = text.replace(/\"\\s*}\\s*\\]\\s*}\\s*}\\s*\\].*$/s, '');\n  text = text.replace(/\",\"thoughtSignature\".*$/s, '');\n  text = text.replace(/\"\\s*,\\s*\"usageMetadata\".*$/s, '');\n  text = text.replace(/\"\\s*,\\s*\"promptTokenCount\".*$/s, '');\n  return text;\n}\n\n// Function to convert markdown formatting to HTML\nfunction convertMarkdownToHtml(text) {\n  if (!text) return text;\n  // Convert **bold** to <strong>bold</strong>\n  text = text.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');\n  // Convert *italic* to <em>italic</em> (but not inside HTML tags)\n  text = text.replace(/(?<!<[^>]*)\\*([^*]+)\\*(?![^<]*>)/g, '<em>$1</em>');\n  // Remove any placeholder text like [mention X...] or [insert Y...]\n  text = text.replace(/\\[(?:mention|insert|add|include|describe|explain|note)[^\\]]*\\]/gi, '');\n  // Clean up any double spaces or empty lines that might result\n  text = text.replace(/  +/g, ' ');\n  text = text.replace(/\\n\\s*\\n\\s*\\n/g, '\\n\\n');\n  return text;\n}\n\nresumeHtml = cleanJsonWrapper(resumeHtml);\ncoverHtml = cleanJsonWrapper(coverHtml);\n\n// Clean any markdown code blocks if present\nresumeHtml = resumeHtml.replace(/```html\\n?/gi, '').replace(/```\\n?/gi, '').trim();\ncoverHtml = coverHtml.replace(/```html\\n?/gi, '').replace(/```\\n?/gi, '').trim();\n\n// Convert any remaining markdown to HTML\nresumeHtml = convertMarkdownToHtml(resumeHtml);\ncoverHtml = convertMarkdownToHtml(coverHtml);\n\n// Ensure valid HTML wrapper if missing\nif (!resumeHtml.toLowerCase().includes('<!doctype') && !resumeHtml.toLowerCase().includes('<html')) {\n  resumeHtml = `<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Resume - Brandon Ruiz</title></head><body>${resumeHtml}</body></html>`;\n}\nif (!coverHtml.toLowerCase().includes('<!doctype') && !coverHtml.toLowerCase().includes('<html')) {\n  coverHtml = `<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Cover Letter - Brandon Ruiz</title></head><body>${coverHtml}</body></html>`;\n}\n\n// Create safe filename from company name\nconst company = (jobData.company || 'Unknown')\n  .replace(/[^a-zA-Z0-9\\s]/g, '')\n  .replace(/\\s+/g, '_')\n  .substring(0, 30);\n\nconst appNum = jobData.application_number;\n\nreturn [\n  {\n    json: {\n      company: company,\n      application_number: appNum,\n      is_remote: jobData.is_remote,\n      job_url: jobData.url,\n      job_title: jobData.title,\n      stats: jobData.stats,\n      timestamp: jobData.timestamp,\n      resume_filename: `${company}_${appNum}_Resume.pdf`,\n      cover_filename: `${company}_${appNum}_CoverLetter.pdf`\n    },\n    binary: {\n      resume_html: {\n        data: Buffer.from(resumeHtml).toString('base64'),\n        mimeType: 'text/html',\n        fileName: 'index.html'\n      },\n      cover_html: {\n        data: Buffer.from(coverHtml).toString('base64'),\n        mimeType: 'text/html',\n        fileName: 'index.html'\n      }\n    }\n  }\n];"
+      },
+      "id": "prepare-html",
+      "name": "Prepare HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [820, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://gotenberg:3000/forms/chromium/convert/html",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "files",
+              "inputDataFieldName": "resume_html"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "resume_pdf"
+            }
+          }
+        }
+      },
+      "id": "pdf-resume",
+      "name": "PDF Resume",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://gotenberg:3000/forms/chromium/convert/html",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "files",
+              "inputDataFieldName": "cover_html"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "cover_pdf"
+            }
+          }
+        }
+      },
+      "id": "pdf-cover",
+      "name": "PDF Cover",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 400]
+    },
+    {
+      "parameters": {
+        "mode": "append"
+      },
+      "id": "wait-for-pdfs",
+      "name": "Wait for PDFs",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1000, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Merge everything together\nconst metadata = $('Prepare HTML').first().json;\nconst resumeBinary = $('PDF Resume').first().binary;\nconst coverBinary = $('PDF Cover').first().binary;\n\n// Get the actual binary data (might be under different keys)\nconst resumePdf = resumeBinary.resume_pdf || resumeBinary.data || Object.values(resumeBinary)[0];\nconst coverPdf = coverBinary.cover_pdf || coverBinary.data || Object.values(coverBinary)[0];\n\nreturn [{\n  json: {\n    ...metadata\n  },\n  binary: {\n    resume_pdf: resumePdf,\n    cover_pdf: coverPdf\n  }\n}];"
+      },
+      "id": "merge-pdfs",
+      "name": "Merge PDFs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1150, 300]
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/output/{{ $json.resume_filename }}",
+        "dataPropertyName": "resume_pdf"
+      },
+      "id": "save-resume",
+      "name": "Save Resume",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [1320, 200]
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/output/{{ $json.cover_filename }}",
+        "dataPropertyName": "cover_pdf"
+      },
+      "id": "save-cover",
+      "name": "Save Cover",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [1320, 400]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Log application - simplified (no fs access)\nconst metadata = $json;\n\n// Store in workflow staticData for later retrieval\nlet applications = $getWorkflowStaticData('global').applications || [];\napplications.push({\n  application_number: metadata.application_number,\n  company: metadata.company,\n  job_title: metadata.job_title,\n  job_url: metadata.job_url,\n  resume_file: `/output/${metadata.resume_filename}`,\n  cover_file: `/output/${metadata.cover_filename}`,\n  created_at: metadata.timestamp,\n  status: 'PENDING'\n});\n$getWorkflowStaticData('global').applications = applications;\n\nreturn [{ json: { success: true, ...metadata } }];"
+      },
+      "id": "log-application",
+      "name": "Log & Queue",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1540, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, application_number: $json.application_number, company: $json.company, files: { resume: $json.resume_filename, cover: $json.cover_filename }, stats: $json.stats }) }}"
+      },
+      "id": "respond",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1760, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [[{ "node": "Counter", "type": "main", "index": 0 }]]
+    },
+    "Counter": {
+      "main": [
+        [
+          { "node": "Resume Writer", "type": "main", "index": 0 },
+          { "node": "Cover Letter Writer", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Resume Writer": {
+      "main": [[{ "node": "Parse Resume Response", "type": "main", "index": 0 }]]
+    },
+    "Cover Letter Writer": {
+      "main": [[{ "node": "Parse Cover Response", "type": "main", "index": 0 }]]
+    },
+    "Parse Resume Response": {
+      "main": [[{ "node": "Wait for Both", "type": "main", "index": 0 }]]
+    },
+    "Parse Cover Response": {
+      "main": [[{ "node": "Wait for Both", "type": "main", "index": 1 }]]
+    },
+    "Wait for Both": {
+      "main": [[{ "node": "Prepare HTML", "type": "main", "index": 0 }]]
+    },
+    "Prepare HTML": {
+      "main": [
+        [
+          { "node": "PDF Resume", "type": "main", "index": 0 },
+          { "node": "PDF Cover", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "PDF Resume": {
+      "main": [[{ "node": "Wait for PDFs", "type": "main", "index": 0 }]]
+    },
+    "PDF Cover": {
+      "main": [[{ "node": "Wait for PDFs", "type": "main", "index": 1 }]]
+    },
+    "Wait for PDFs": {
+      "main": [[{ "node": "Merge PDFs", "type": "main", "index": 0 }]]
+    },
+    "Merge PDFs": {
+      "main": [
+        [
+          { "node": "Save Resume", "type": "main", "index": 0 },
+          { "node": "Save Cover", "type": "main", "index": 0 },
+          { "node": "Log & Queue", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Log & Queue": {
+      "main": [[{ "node": "Respond", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": true
+}

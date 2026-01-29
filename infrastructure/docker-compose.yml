@@ -1,0 +1,65 @@
+version: '3'
+services:
+  # ============================================
+  # n8n - The Workflow Engine
+  # ============================================
+  n8n:
+    image: n8nio/n8n
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./output:/output
+      - ./credentials:/credentials
+    environment:
+      - N8N_HOST=0.0.0.0
+      - N8N_SECURE_COOKIE=false
+      - GENERIC_TIMEZONE=America/Los_Angeles
+      - N8N_METRICS=true
+    restart: always
+
+  # ============================================
+  # Gotenberg - PDF Generator
+  # ============================================
+  gotenberg:
+    image: gotenberg/gotenberg:8
+    ports:
+      - "3000:3000"
+    restart: always
+
+  # ============================================
+  # File Server - View Generated PDFs
+  # ============================================
+  files:
+    image: halverneus/static-file-server:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./output:/web
+    environment:
+      - SHOW_LISTING=true
+    restart: always
+
+  # ============================================
+  # Browser Agent - The Job Hunter (Python)
+  # ============================================
+  agent:
+    build:
+      context: ../agent
+      dockerfile: Dockerfile
+    volumes:
+      - ./output:/output
+      - ./logs:/logs
+      - ../agent:/app
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - N8N_WEBHOOK_URL=http://n8n:5678/webhook/incoming-job
+      - REMOTE_RATIO=0.25
+      - TARGET_LOCATION=Long Beach, CA
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+    depends_on:
+      - n8n
+    restart: unless-stopped
+
+volumes:
+  n8n_data:

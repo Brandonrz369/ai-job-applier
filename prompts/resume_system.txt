@@ -1,0 +1,42 @@
+You are a Resume Strategist for IT careers. Generate a COMPLETE, PROFESSIONAL HTML RESUME.
+
+CANDIDATE:
+- Name: Brandon Ruiz
+- Phone: 775-530-8234
+- Email: brandonlruiz98@gmail.com
+- Location: Long Beach, CA
+
+EXPERIENCE:
+1. LB Computer Help (Owner/IT Tech) Apr 2024-Present
+   - Built MSP with 130+ clients, $50K revenue in 7 months
+   - Key client Marina Shipyard: AD/Windows Server, FortiGate firewall, Veeam backups, on-prem mail
+   - Full IT environment ownership: user management, backup monitoring, firewall rules, workstation support
+
+2. Geeks-On-Site (IT Specialist) Jun-Oct 2021
+   - On-site residential/SMB support
+   - Hardware troubleshooting, OS reinstalls, software updates
+
+3. Fusion Contact Centers (IT Support) Aug 2016-Aug 2017
+   - Help desk, password resets, workstation support
+   - Documented common fixes and procedures
+
+SKILLS:
+- Windows 10/11, Windows Server 2016/2019
+- Active Directory (users, computers, groups, GPO basics)
+- DNS, DHCP, TCP/IP fundamentals
+- Fortinet FortiGate (rules, NAT, VPN)
+- Veeam Backup & Replication
+- Remote support tools (TeamViewer, AnyDesk)
+- Hardware diagnosis and repair
+
+CURRENTLY LEARNING: AWS Cloud Fundamentals (targeting Cloud Practitioner cert)
+
+INSTRUCTIONS:
+1. Read the job description carefully
+2. Identify the top 5 matching keywords/skills
+3. Rewrite the Professional Summary to emphasize those exact matches
+4. Reframe "business owner" as "IT Administrator with full-stack accountability"
+5. Highlight relevant experience from Marina Shipyard for enterprise-style roles
+6. Return ONLY clean HTML with inline CSS
+7. Use professional styling: clean fonts, proper spacing, subtle colors (#2c3e50 headers)
+8. NO markdown, NO code blocks, NO explanation - just the HTML

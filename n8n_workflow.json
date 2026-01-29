@@ -1,0 +1,383 @@
+{
+  "name": "Job Application Factory v3 - Complete",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "incoming-job",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "2524eaac-9c8b-4c85-bcef-144f72ab500d",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        112
+      ],
+      "webhookId": "f40141ff-fe0a-4fe7-852c-0329c1ce3e3a"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $json.body || $json;\n\nreturn {\n  company: data.company || 'Unknown_Company',\n  title: data.title || 'Unknown_Title',\n  description: data.description || '',\n  url: data.url || '',\n  location: data.location || '',\n  application_number: data.application_number || Date.now()\n};"
+      },
+      "id": "3202aedb-bb84-4c1c-8c16-094926134984",
+      "name": "Counter",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -224,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const resumeData = $input.first().json;\nconst jobData = $('Counter').first().json;\n\n// Get HTML - adjust based on Simplify Output setting\nlet resumeHtml = resumeData.message || resumeData.content?.[0]?.text || resumeData.text || JSON.stringify(resumeData);\n\n// Clean markdown code blocks\nresumeHtml = resumeHtml.replace(/```html\\n?/gi, '').replace(/```\\n?/gi, '').trim();\n\n// Ensure valid HTML wrapper\nif (!resumeHtml.toLowerCase().includes('<!doctype') && !resumeHtml.toLowerCase().includes('<html')) {\n  resumeHtml = `<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Resume - Brandon Ruiz</title></head><body>${resumeHtml}</body></html>`;\n}\n\n// Clean company name for filename\nconst company = (jobData.company || 'Unknown')\n  .replace(/[^a-zA-Z0-9\\s]/g, '')\n  .replace(/\\s+/g, '_')\n  .substring(0, 30);\n\nconst appNum = jobData.application_number;\n\n// Create binary data for Gotenberg\nconst resumeBinary = await this.helpers.prepareBinaryData(\n  Buffer.from(resumeHtml, 'utf-8'),\n  'index.html',\n  'text/html'\n);\n\nreturn [{\n  json: {\n    company: company,\n    application_number: appNum,\n    resume_filename: `${company}_${appNum}_Resume.pdf`\n  },\n  binary: {\n    data: resumeBinary\n  }\n}];"
+      },
+      "id": "fe5a190b-6b78-402e-b563-06e110f13d94",
+      "name": "Prepare HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://gotenberg:3000/forms/chromium/convert/html",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "files",
+              "inputDataFieldName": "data"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "resume_pdf"
+            }
+          }
+        }
+      },
+      "id": "85e13bb0-301a-4c44-ab4a-1c010c73d165",
+      "name": "PDF Resume",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        464,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://gotenberg:3000/forms/chromium/convert/html",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "parameterType": "formBinaryData",
+              "name": "files",
+              "inputDataFieldName": "data"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "cover_pdf"
+            }
+          }
+        }
+      },
+      "id": "b49b980d-a103-4f99-ba68-adf3ac95a1ed",
+      "name": "PDF Cover",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        464,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/output/{{ $('Counter').item.json.company.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 30) }}_{{ $('Counter').item.json.application_number }}_Resume.pdf",
+        "dataPropertyName": "resume_pdf",
+        "options": {}
+      },
+      "id": "f7ae9a82-7c69-4541-a38f-8b699e5f91db",
+      "name": "Save Resume",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        896,
+        -16
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "=/output/{{ $('Counter').item.json.company.replace(/[^a-zA-Z0-9]/g, '_').slice(0, 30) }}_{{ $('Counter').item.json.application_number }}_CoverLetter.pdf",
+        "dataPropertyName": "cover_pdf",
+        "options": {}
+      },
+      "id": "1bd89612-004d-40ca-8cad-fc37d0fb7ac5",
+      "name": "Save Cover",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        896,
+        192
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, application_number: $json.application_number, company: $json.company, files: { resume: $json.resume_filename, cover: $json.cover_filename }, stats: $json.stats }) }}",
+        "options": {}
+      },
+      "id": "fc50cda2-74cb-40de-b48a-5cc3bf3de92c",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1360,
+        96
+      ]
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1104,
+        96
+      ],
+      "id": "529f145d-d3b6-405f-b598-2faadd0f74c8",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "claude-opus-4-5-20251101",
+          "mode": "list",
+          "cachedResultName": "claude-opus-4-5-20251101"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=Comprehensive Candidate Profile for Brandon Ruiz\nUsed by scorer.py and n8n prompts\n\"\"\"\n\nCANDIDATE_FULL_PROFILE = \"\"\"\n=============================================================================\nBRANDON RUIZ - COMPLETE PROFESSIONAL PROFILE\n=============================================================================\n\nCONTACT:\n- Location: Long Beach / Orange County, CA\n- GitHub: github.com/brandonrz369\n- Available for: On-site (OC/LA area), Hybrid, Limited Remote\n\n=============================================================================\nPROFESSIONAL EXPERIENCE\n=============================================================================\n\nLB COMPUTER HELP (Owner / IT Support Technician) | Apr 2025 - Present\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nBuilt an MSP from zero to 130+ customers and $50K revenue.\n\nBUSINESS DEVELOPMENT & MARKETING:\n- Launched with $0 budget using Yelp's free ad credit for initial visibility\n- Posted on Craigslist and Facebook community groups for local reach\n- Scaled to Google Ads campaigns - this drove significant customer acquisition\n- Grew through reputation - organic referrals became primary lead source\n- Managed all operations: sales, service delivery, invoicing (Square), scheduling\n\nB2B EMERGENCY IT SUPPORT:\n- Provided emergency IT support to dozens of businesses:\n  * Subway franchise locations - POS and network issues\n  * Gas stations - complex network outages affecting payment systems\n  * Professional offices - server failures, connectivity issues\n- Diagnosed and resolved problems under pressure - businesses losing money every minute\n- Developed ability to quickly assess unfamiliar environments and isolate issues\n- Built reputation for solving problems other techs couldn't figure out\n- Demonstrated ability to work across multiple strange spectrums of knowledge\n\nREMOTE MANAGEMENT:\n- Deployed and managed N-Able RMM agents across multiple client environments\n- Provided proactive monitoring, patch management, and remote remediation\n- Managed multiple businesses remotely simultaneously\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nPRIMARY CLIENT - MARINA SHIPYARD | Jul 2024 - Present\nContract Value: $17,000 Year 1 ($975/month + $4,950 one-time migration fee)\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nExecuted complete MSP transition from All Covered (large national MSP) to my \nown management. Full infrastructure modernization with zero downtime.\n\nBEFORE STATE (All Covered MSP):\n- Email Security: ProofPoint (third-party, MX routing through ppe-hosted.com)\n- DNS: Rackspace nameservers - no direct control\n- Antivirus: BitDefender via N-Able (MSP controlled)\n- Web Filtering: Cisco Umbrella\n- Backup: All Covered Cloud (proprietary, expensive)\n- Remote Management: N-Able agent (MSP controlled)\n- M365: Business Standard, managed by All Covered CSP\n- Documentation: Minimal/scattered\n\nAFTER STATE (My Management):\n- Email Security: Microsoft Defender for Office 365 (native, integrated)\n- DNS: GoDaddy (direct client control)\n- Antivirus: BitDefender GravityZone (own tenant)\n- Web Filtering: DNS-based + Microsoft Defender\n- Backup: Backblaze B2 (~$5/TB/month vs proprietary pricing)\n- Remote Management: SSL VPN + iDRAC + direct management\n- M365: Business Premium, CSP transferred to me\n- Documentation: Comprehensive guides, network diagrams, quick reference cards\n\nPROJECT 1: Complex DNS & Email Migration\n- Challenge: Domain at GoDaddy, DNS hosted on Rackspace nameservers, email \n  routed through ProofPoint before reaching M365, previous MSP engineer on \n  vacation during critical transition\n- Solution: Coordinated with outgoing MSP engineer (Brett), obtained complete \n  DNS record export, documented everything, planned migration\n- Technical Details:\n  * Identified and documented: 2 A records, 8 CNAME records, 2 MX records, \n    2 SRV records, 5 TXT records\n  * Updated SPF from ProofPoint inclusion to Microsoft-only\n  * Configured autodiscover, enterprise enrollment for device management\n- Result: Simplified architecture, reduced attack surface, direct client control\n\nPROJECT 2: Enterprise Backup Infrastructure Migration\n- Challenge: Previous MSP terminating cloud storage service, client faced \n  potential data loss and backup gaps\n- Solution: Evaluated multiple providers (AWS S3, Azure Blob, Backblaze B2, \n  Wasabi), selected Backblaze B2 for cost-effectiveness\n- Technical Implementation:\n  * Created encrypted bucket with Object Lock (ransomware protection)\n  * Configured application keys with least-privilege access\n  * Created comprehensive migration guide for Veeam reconfiguration\n  * Maintained existing Synology NAS backups as redundancy during transition\n- Cost Savings: From proprietary pricing to ~$5/TB/month\n\nPROJECT 3: Network Infrastructure Documentation & Remote Access\n- Challenge: Complex dual-WAN environment with Fortinet SD-WAN, multiple \n  network segments, various VM access methods, minimal existing documentation\n- Solution: Created comprehensive technical documentation from scratch:\n  * Network topology diagrams\n  * Field technician quick reference card\n  * Step-by-step access procedures (SSL VPN, iDRAC, ESXi console)\n  * Troubleshooting decision trees\n  * FortiGate command references\n\nPROJECT 4: Microsoft 365 License Optimization\n- Challenge: 7 Business Standard licenses managed by previous MSP, expiring \n  April 10, 2025, with Microsoft price increases effective April 1\n- Solution: Coordinated CSP transfer, upgraded users to Business Premium for \n  enhanced security features (Defender for Office 365, Intune capabilities)\n\nTECHNICAL ENVIRONMENT MANAGED:\nNetwork Infrastructure:\n- Dual WAN Configuration:\n  * Frontier (Primary): 1Gbps fiber\n  * ECCO Wireless (Secondary): 100Mbps backup\n- Fortinet 60F Firewall (192.168.0.1)\n  * SD-WAN configured for failover/load balancing\n  * SSL VPN for remote access\n  * Managing two internal networks\n- Main LAN: 192.168.0.0/24\n- Secondary LAN: 10.10.10.0/24\n\nVirtualization:\n- Dell PowerEdge T350 (192.168.0.11)\n- VMware ESXi 8.0.3\n- iDRAC (192.168.0.10) for remote management\n- VMs:\n  * IEMS-DC01V (Domain Controller + Veeam)\n  * IEMS-FS01V (File Server)\n  * OPS-INDEL-V (Ubuntu Linux)\n\nStorage:\n- Synology NAS (192.168.0.40) - Veeam repository\n- Backblaze B2 cloud backup with Object Lock\n\nUsers/Workstations: 7 total\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nGEEKS-ON-SITE (IT Specialist) | Jun 2021 - Oct 2021\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n- Dispatched to residential and small business locations for break-fix support\n- Diagnosed hardware failures, malware infections, network connectivity issues\n- Performed data recovery, system rebuilds, and hardware upgrades\n- Developed customer communication skills - explaining technical issues to \n  non-technical users\n- Consistently received positive customer feedback\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nJFG SYSTEMS (IT Consultant - MSP) | Feb 2019 - Mar 2019\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n- Worked at established MSP learning professional service delivery standards\n- Supported multiple client environments with varying technology stacks\n- Gained exposure to MSP business operations, ticketing workflows, SLAs\n- Foundation for launching my own MSP with professional standards\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nRADMAX (Contract - Penetration Testing) | During Fusion tenure (2016-2017)\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n- Contracted at age 18 to perform penetration testing on company network\n- Utilized Metasploit framework for vulnerability assessment\n- Applied knowledge from years of self-taught security research\n- Configured Amazon AWS VPS to host the penetration testing environment\n- Provided C-level executives with real-time dashboard to monitor attack progress\n- Delivered findings and recommendations to stakeholders\n- Early professional validation of security skills developed since childhood\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nFUSION CONTACT CENTERS (IT Support \u2192 Escalation Team) | Aug 2016 - Aug 2017\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nStarted as Tier 1 help desk. PROMOTED TO ESCALATION TEAM AT AGE 18.\nHandled higher-tier tickets that frontline support couldn't resolve.\nWorked with enterprise-grade network environments across diverse clients.\n\nENTERPRISE FIREWALL EXPERIENCE:\n- Troubleshot nearly every major firewall brand in production environments:\n  * Cisco ASA\n  * Fortinet FortiGate\n  * SonicWall\n  * Palo Alto\n  * Meraki\n  * pfSense\n- Diagnosed and resolved WAN connectivity issues under pressure\n- Configured and debugged firewall rules for various applications\n\nVOIP/UNIFIED COMMUNICATIONS:\n- Extensive 8x8 VoIP troubleshooting\n- SIP trunk configuration and debugging\n- Resolved \"phones are down\" emergencies affecting entire offices\n- WAN rules, QoS, and network configuration for voice traffic\n- When 50 phones go down and a business is paralyzed, you learn to isolate \n  issues FAST\n- Figured out everything under the sun to get 8x8 to work on client systems\n\n- Exposure to massive variety of enterprise environments and configurations\n- Developed rapid troubleshooting skills under extreme pressure\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nADDITIONAL WORK HISTORY (Demonstrating Work Ethic)\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n- LAZ Parking (Supervisor) | Nov 2022 - Present\n- Randstad / Innovation Bakery (Warehouse/Machine Operator) | Oct 2022 - Present\n- DoorDash (Driver/Gig Work) | Oct 2021 - Present\n- Valeo (Warehouse/Machine Operator) | Apr 2019 - Dec 2019\n\n=============================================================================\nTECHNICAL SKILLS\n=============================================================================\n\nINFRASTRUCTURE & SYSTEMS:\n- Windows Server 2016/2019/2022\n- Active Directory, Group Policy, DNS, DHCP\n- VMware ESXi 8.x, vCenter basics, VM provisioning and management\n- Dell PowerEdge servers, iDRAC remote management\n- Synology NAS configuration and management\n\nNETWORKING & FIREWALLS:\n- Multi-vendor production experience:\n  * Fortinet FortiGate (primary at Marina)\n  * Cisco ASA\n  * SonicWall\n  * Palo Alto\n  * Meraki\n  * pfSense\n- TCP/IP, VLANs, routing, dual-WAN failover, SD-WAN\n- SSL VPN configuration and troubleshooting\n- Network documentation and topology diagrams\n\nVOIP & UNIFIED COMMUNICATIONS:\n- 8x8 VoIP troubleshooting and configuration (extensive)\n- SIP trunk debugging\n- WAN rules for voice traffic\n- QoS configuration for call quality\n- Enterprise phone system support (multi-vendor)\n- Emergency \"phones down\" resolution under pressure\n\nMICROSOFT 365 & CLOUD:\n- M365 Administration: Exchange Online, SharePoint, Teams, OneDrive\n- Microsoft Defender for Office 365\n- Azure AD basics, Intune fundamentals\n- CSP licensing and tenant management\n- SPF/DKIM/DMARC email authentication\n- AWS (VPS configuration for pen testing)\n\nBACKUP & DISASTER RECOVERY:\n- Veeam Backup & Replication\n- Backblaze B2 with Object Lock (ransomware protection)\n- Backup strategy design, retention policies, restore testing\n- Synology NAS as backup repository\n\nSECURITY & PENETRATION TESTING:\n- Metasploit framework (professional pen testing experience)\n- Network vulnerability assessment\n- AWS VPS configuration for security testing\n- Endpoint protection (BitDefender GravityZone, Microsoft Defender)\n- MFA implementation, security awareness\n- Security-first mindset from early self-teaching\n\nTOOLS & AUTOMATION:\n- RMM: N-Able (deployment, monitoring, remote access)\n- Python scripting and automation\n- n8n workflow automation\n- AI/LLM integration (Claude API, workflow design)\n- Invoicing: Square\n- Documentation: Network diagrams, runbooks, quick reference cards\n\n=============================================================================\nPERSONAL PROJECTS & TECHNICAL BACKGROUND\n=============================================================================\n\nAUTONOMOUS JOB APPLICATION AGENT (Current Project - 2025)\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nBuilt a fully autonomous system that scrapes job postings, scores them for \nrelevance using AI, generates tailored resumes/cover letters, and will \neventually auto-apply. THIS APPLICATION WAS GENERATED BY THAT SYSTEM.\n\nArchitecture:\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510   \u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510   \u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510   \u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502 Scrape  \u2502 \u2192 \u2502  Score  \u2502 \u2192 \u2502Generate \u2502 \u2192 \u2502  Apply  \u2502\n\u2502 JobSpy  \u2502   \u2502  Haiku  \u2502   \u2502 Opus4.5 \u2502   \u2502Comp.Use \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518   \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518   \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518   \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\nTech Stack:\n- Python (JobSpy for scraping, proxy rotation)\n- n8n workflow automation (self-hosted on Hetzner VPS)\n- Claude AI: Haiku for job scoring, Opus 4.5 for document generation\n- Gotenberg for HTML-to-PDF conversion\n- Docker containerization\n- Deduplication system (job ID, URL, company+title hash)\n- Queue management (pending, applied, failed, manual)\n\nDemonstrates: API integration, workflow design, cost optimization\n(using cheaper models where appropriate), error handling, systems thinking.\n\nGitHub: github.com/brandonrz369/job-agent\n\nCRAIGSLIST SCRAPER WITH PROXY ROTATION\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n- Built Python scraper aligned with skillsets\n- Scrapes Craigslist for opportunities\n- Implements proxy switching to avoid rate limiting\n- Built with AI assistance\n\nGITHUB PROJECTS (github.com/brandonrz369)\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n1. pokerresearch - C++/Python Poker HUD & Strategy Agent\n   - Prototypes a poker heads-up display and action-recommendation agent\n   - Features: state ingestion, game modeling, baseline strategies, overlay\n   - Includes hooks for LLM integration (pointing HUD at internal LLM)\n   - Dataset helpers for research\n   - University of Nevada research project\n\n2. lbcom & smart-services-it - Business Websites\n   - Full Next.js/Tailwind CSS website templates\n   - Clone, install, customize, deploy workflow\n   - Deployment to Vercel or Netlify\n   - Custom domain configuration\n\n3. Gemini-Scraper\n   - Python-dominated scraper project\n   - Includes Python and C/Cython code\n   - Associated site hosted on Vercel\n\n4. gravy-scraper & gravybaby\n   - Python automation/scraping tools\n   - Job board scraping with proxy rotation\n\n5. Other repositories:\n   - powerpoint - Firebase tools setup\n   - mar - Project with Anthropic Claude assistance\n\nXDA DEVELOPERS CONTRIBUTIONS (2013-2015) - Age 16\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n[1] N.E.O.N. R.O.M. - Verizon Galaxy Note 3 (Build 3 Version 5)\n    Started December 2, 2013 in Android Development section\n    \n    - Created custom ROM described as \"go-to\" option for users seeking \n      \"tweaked, slim, stock, fast rom with OUTSTANDING battery life\"\n    - Removed 189 pre-installed apps (717 MB saved)\n    - Sub-500MB ROM, Knox-free\n    - Disabled Samsung annoyances\n    - Added AOSP-themed features:\n      * ICS-style icons\n      * 4.4 sound pack\n      * AOSP lock screen\n    - Suite of performance tweaks:\n      * 5\u00d75 launcher with 6-icon dock\n      * Sound-boost hack\n      * Infinite launcher scroll\n      * Disabled scrolling cache for smoother performance\n    - Pre-rooted with BusyBox, zipalignment, init.d support\n    - Credited collaborators (sbreen94, foreverloco, XzxBATTxzX, AngryManMLS)\n    - Provided download links for ROM, add-on theme, Samsung camera module\n    - Maintained updates and community support\n\n[2] Petition to Unlock Bootloader (October 20, 2013)\n    - Organized community petition urging Samsung and Verizon to unlock \n      Galaxy Note 3 bootloader\n    - Encouraged users to sign Change.org petition\n    - Listed executive names, phone numbers, and email addresses for \n      direct pressure campaign\n    - Community activism for user freedom\n\n[3] Safestrap Installation Guide (November 11, 2013)\n    - Authored detailed guide explaining how to install custom ROMs over \n      stock partition without wasting space or triggering Knox\n    - Specified prerequisites: rooted N900V, Safestrap v3.62, Odin\n    - Step-by-step instructions for backup, ROM slot creation, restoration\n\n[4] Note 3 KitKat Root Guide (June 16, 2014)\n    - Shared instructions on using Geohot's Towelroot exploit\n    - Root on Note 3 running Android 4.4.2\n    - Concise, accessible instructions for community\n\n[5] HTC One M8 S-OFF Guide Contribution (October 18, 2015)\n    - Sought and shared advice on updating firmware while preserving \n      S-OFF status and user data\n\nSUMMARY OF XDA CONTRIBUTIONS:\n- Demonstrates deep technical curiosity at age 16\n- Documentation skills - created guides others could follow\n- Community contribution and collaboration\n- System optimization and customization\n- Activism for user rights and device freedom\n\nORIGIN STORY\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nSelf-taught from necessity. As a teenager with an overbearing mother, \ntechnology became my outlet. When I had issues with parental controls, I \ninstalled Linux or other tools to remove them. When we didn't have WiFi \nanymore, I bought an antenna off eBay and burned a Linux distro to access \nneighbors' networks. Got really good at it too.\n\nThis problem-solving mindset - finding technical solutions to real \nconstraints - has defined my approach to IT ever since. I don't wait for \npermission or training; I figure it out.\n\n=============================================================================\nWHAT MAKES ME DIFFERENT\n=============================================================================\n\n1. PROMOTED AT 18: Moved to escalation team at Fusion handling tickets that\n   stumped experienced techs. Employers recognized my abilities early.\n\n2. SECURITY BACKGROUND: Professional pen testing contract at 18. Self-taught\n   from childhood. I think like an attacker, defend like a pro.\n\n3. MULTI-VENDOR FIREWALL FLUENCY: Cisco, Fortinet, SonicWall, Palo Alto, \n   Meraki, pfSense - all in production environments. Not just one vendor.\n\n4. ENTREPRENEURIAL: Built a real MSP, won a $17K contract, handled emergency\n   outages where businesses were losing money. I understand business impact.\n\n5. VOIP UNDER PRESSURE: When 50 phones go down and a business is paralyzed,\n   I've been the one isolating SIP issues. I know 8x8 inside and out.\n\n6. FULL STACK: Help desk to pen testing to MSP owner. I've worked every \n   level and understand how they connect.\n\n7. DOCUMENTATION OBSESSED: I create network diagrams, runbooks, and quick\n   reference cards because good documentation prevents 3am emergencies.\n\n8. BUILDS TOOLS: Not just uses them. This job application came from an\n   AI-powered system I built myself. That's how I approach problems.\n\n9. ROM DEVELOPER AT 16: Was publishing custom Android ROMs with thousands\n   of downloads while still in high school. Deep technical curiosity.\n\n10. WORKS HARD: Maintained IT career development while working supervisor,\n    warehouse, and gig jobs. Whatever it takes.\n\n=============================================================================\nEDUCATION & CERTIFICATIONS\n=============================================================================\n- Currently studying for AWS Cloud Practitioner\n- Continuous self-education via documentation, labs, and real-world projects\n- No formal degree - 100% self-taught and battle-tested\n\n=============================================================================\n```\n=== TARGET JOB ===\nCompany: {{ $json.company }}\nTitle: {{ $json.title }}\nLocation: {{ $json.location }}\nDescription: {{ $json.description }}\n\n=== INSTRUCTIONS ===\nCreate a 1-page tailored resume for this specific job. Match my experience to their requirements. Emphasize relevant skills and projects. Quantify achievements. Return ONLY valid HTML with inline CSS. No markdown. No code blocks.\n```"
+            }
+          ]
+        },
+        "simplify": false,
+        "options": {
+          "maxTokens": 4096
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [
+        -64,
+        -32
+      ],
+      "id": "345d6436-3b8c-4c5d-9168-0643944039a9",
+      "name": "Resume Writer1",
+      "credentials": {
+        "anthropicApi": {
+          "id": "r594dWEDlk4qY8Ok",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "claude-opus-4-5-20251101",
+          "mode": "list",
+          "cachedResultName": "claude-opus-4-5-20251101"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=Comprehensive Candidate Profile for Brandon Ruiz\nUsed by scorer.py and n8n prompts\n\"\"\"\n\nCANDIDATE_FULL_PROFILE = \"\"\"\n=============================================================================\nBRANDON RUIZ - COMPLETE PROFESSIONAL PROFILE\n=============================================================================\n\nCONTACT:\n- Location: Long Beach / Orange County, CA\n- GitHub: github.com/brandonrz369\n- Available for: On-site (OC/LA area), Hybrid, Limited Remote\n\n=============================================================================\nPROFESSIONAL EXPERIENCE\n=============================================================================\n\nLB COMPUTER HELP (Owner / IT Support Technician) | Apr 2025 - Present\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nBuilt an MSP from zero to 130+ customers and $50K revenue.\n\nBUSINESS DEVELOPMENT & MARKETING:\n- Launched with $0 budget using Yelp's free ad credit for initial visibility\n- Posted on Craigslist and Facebook community groups for local reach\n- Scaled to Google Ads campaigns - this drove significant customer acquisition\n- Grew through reputation - organic referrals became primary lead source\n- Managed all operations: sales, service delivery, invoicing (Square), scheduling\n\nB2B EMERGENCY IT SUPPORT:\n- Provided emergency IT support to dozens of businesses:\n  * Subway franchise locations - POS and network issues\n  * Gas stations - complex network outages affecting payment systems\n  * Professional offices - server failures, connectivity issues\n- Diagnosed and resolved problems under pressure - businesses losing money every minute\n- Developed ability to quickly assess unfamiliar environments and isolate issues\n- Built reputation for solving problems other techs couldn't figure out\n- Demonstrated ability to work across multiple strange spectrums of knowledge\n\nREMOTE MANAGEMENT:\n- Deployed and managed N-Able RMM agents across multiple client environments\n- Provided proactive monitoring, patch management, and remote remediation\n- Managed multiple businesses remotely simultaneously\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nPRIMARY CLIENT - MARINA SHIPYARD | Jul 2024 - Present\nContract Value: $17,000 Year 1 ($975/month + $4,950 one-time migration fee)\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nExecuted complete MSP transition from All Covered (large national MSP) to my \nown management. Full infrastructure modernization with zero downtime.\n\nBEFORE STATE (All Covered MSP):\n- Email Security: ProofPoint (third-party, MX routing through ppe-hosted.com)\n- DNS: Rackspace nameservers - no direct control\n- Antivirus: BitDefender via N-Able (MSP controlled)\n- Web Filtering: Cisco Umbrella\n- Backup: All Covered Cloud (proprietary, expensive)\n- Remote Management: N-Able agent (MSP controlled)\n- M365: Business Standard, managed by All Covered CSP\n- Documentation: Minimal/scattered\n\nAFTER STATE (My Management):\n- Email Security: Microsoft Defender for Office 365 (native, integrated)\n- DNS: GoDaddy (direct client control)\n- Antivirus: BitDefender GravityZone (own tenant)\n- Web Filtering: DNS-based + Microsoft Defender\n- Backup: Backblaze B2 (~$5/TB/month vs proprietary pricing)\n- Remote Management: SSL VPN + iDRAC + direct management\n- M365: Business Premium, CSP transferred to me\n- Documentation: Comprehensive guides, network diagrams, quick reference cards\n\nPROJECT 1: Complex DNS & Email Migration\n- Challenge: Domain at GoDaddy, DNS hosted on Rackspace nameservers, email \n  routed through ProofPoint before reaching M365, previous MSP engineer on \n  vacation during critical transition\n- Solution: Coordinated with outgoing MSP engineer (Brett), obtained complete \n  DNS record export, documented everything, planned migration\n- Technical Details:\n  * Identified and documented: 2 A records, 8 CNAME records, 2 MX records, \n    2 SRV records, 5 TXT records\n  * Updated SPF from ProofPoint inclusion to Microsoft-only\n  * Configured autodiscover, enterprise enrollment for device management\n- Result: Simplified architecture, reduced attack surface, direct client control\n\nPROJECT 2: Enterprise Backup Infrastructure Migration\n- Challenge: Previous MSP terminating cloud storage service, client faced \n  potential data loss and backup gaps\n- Solution: Evaluated multiple providers (AWS S3, Azure Blob, Backblaze B2, \n  Wasabi), selected Backblaze B2 for cost-effectiveness\n- Technical Implementation:\n  * Created encrypted bucket with Object Lock (ransomware protection)\n  * Configured application keys with least-privilege access\n  * Created comprehensive migration guide for Veeam reconfiguration\n  * Maintained existing Synology NAS backups as redundancy during transition\n- Cost Savings: From proprietary pricing to ~$5/TB/month\n\nPROJECT 3: Network Infrastructure Documentation & Remote Access\n- Challenge: Complex dual-WAN environment with Fortinet SD-WAN, multiple \n  network segments, various VM access methods, minimal existing documentation\n- Solution: Created comprehensive technical documentation from scratch:\n  * Network topology diagrams\n  * Field technician quick reference card\n  * Step-by-step access procedures (SSL VPN, iDRAC, ESXi console)\n  * Troubleshooting decision trees\n  * FortiGate command references\n\nPROJECT 4: Microsoft 365 License Optimization\n- Challenge: 7 Business Standard licenses managed by previous MSP, expiring \n  April 10, 2025, with Microsoft price increases effective April 1\n- Solution: Coordinated CSP transfer, upgraded users to Business Premium for \n  enhanced security features (Defender for Office 365, Intune capabilities)\n\nTECHNICAL ENVIRONMENT MANAGED:\nNetwork Infrastructure:\n- Dual WAN Configuration:\n  * Frontier (Primary): 1Gbps fiber\n  * ECCO Wireless (Secondary): 100Mbps backup\n- Fortinet 60F Firewall (192.168.0.1)\n  * SD-WAN configured for failover/load balancing\n  * SSL VPN for remote access\n  * Managing two internal networks\n- Main LAN: 192.168.0.0/24\n- Secondary LAN: 10.10.10.0/24\n\nVirtualization:\n- Dell PowerEdge T350 (192.168.0.11)\n- VMware ESXi 8.0.3\n- iDRAC (192.168.0.10) for remote management\n- VMs:\n  * IEMS-DC01V (Domain Controller + Veeam)\n  * IEMS-FS01V (File Server)\n  * OPS-INDEL-V (Ubuntu Linux)\n\nStorage:\n- Synology NAS (192.168.0.40) - Veeam repository\n- Backblaze B2 cloud backup with Object Lock\n\nUsers/Workstations: 7 total\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nGEEKS-ON-SITE (IT Specialist) | Jun 2021 - Oct 2021\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n- Dispatched to residential and small business locations for break-fix support\n- Diagnosed hardware failures, malware infections, network connectivity issues\n- Performed data recovery, system rebuilds, and hardware upgrades\n- Developed customer communication skills - explaining technical issues to \n  non-technical users\n- Consistently received positive customer feedback\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nJFG SYSTEMS (IT Consultant - MSP) | Feb 2019 - Mar 2019\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n- Worked at established MSP learning professional service delivery standards\n- Supported multiple client environments with varying technology stacks\n- Gained exposure to MSP business operations, ticketing workflows, SLAs\n- Foundation for launching my own MSP with professional standards\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nRADMAX (Contract - Penetration Testing) | During Fusion tenure (2016-2017)\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n- Contracted at age 18 to perform penetration testing on company network\n- Utilized Metasploit framework for vulnerability assessment\n- Applied knowledge from years of self-taught security research\n- Configured Amazon AWS VPS to host the penetration testing environment\n- Provided C-level executives with real-time dashboard to monitor attack progress\n- Delivered findings and recommendations to stakeholders\n- Early professional validation of security skills developed since childhood\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nFUSION CONTACT CENTERS (IT Support \u2192 Escalation Team) | Aug 2016 - Aug 2017\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nStarted as Tier 1 help desk. PROMOTED TO ESCALATION TEAM AT AGE 18.\nHandled higher-tier tickets that frontline support couldn't resolve.\nWorked with enterprise-grade network environments across diverse clients.\n\nENTERPRISE FIREWALL EXPERIENCE:\n- Troubleshot nearly every major firewall brand in production environments:\n  * Cisco ASA\n  * Fortinet FortiGate\n  * SonicWall\n  * Palo Alto\n  * Meraki\n  * pfSense\n- Diagnosed and resolved WAN connectivity issues under pressure\n- Configured and debugged firewall rules for various applications\n\nVOIP/UNIFIED COMMUNICATIONS:\n- Extensive 8x8 VoIP troubleshooting\n- SIP trunk configuration and debugging\n- Resolved \"phones are down\" emergencies affecting entire offices\n- WAN rules, QoS, and network configuration for voice traffic\n- When 50 phones go down and a business is paralyzed, you learn to isolate \n  issues FAST\n- Figured out everything under the sun to get 8x8 to work on client systems\n\n- Exposure to massive variety of enterprise environments and configurations\n- Developed rapid troubleshooting skills under extreme pressure\n\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nADDITIONAL WORK HISTORY (Demonstrating Work Ethic)\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n- LAZ Parking (Supervisor) | Nov 2022 - Present\n- Randstad / Innovation Bakery (Warehouse/Machine Operator) | Oct 2022 - Present\n- DoorDash (Driver/Gig Work) | Oct 2021 - Present\n- Valeo (Warehouse/Machine Operator) | Apr 2019 - Dec 2019\n\n=============================================================================\nTECHNICAL SKILLS\n=============================================================================\n\nINFRASTRUCTURE & SYSTEMS:\n- Windows Server 2016/2019/2022\n- Active Directory, Group Policy, DNS, DHCP\n- VMware ESXi 8.x, vCenter basics, VM provisioning and management\n- Dell PowerEdge servers, iDRAC remote management\n- Synology NAS configuration and management\n\nNETWORKING & FIREWALLS:\n- Multi-vendor production experience:\n  * Fortinet FortiGate (primary at Marina)\n  * Cisco ASA\n  * SonicWall\n  * Palo Alto\n  * Meraki\n  * pfSense\n- TCP/IP, VLANs, routing, dual-WAN failover, SD-WAN\n- SSL VPN configuration and troubleshooting\n- Network documentation and topology diagrams\n\nVOIP & UNIFIED COMMUNICATIONS:\n- 8x8 VoIP troubleshooting and configuration (extensive)\n- SIP trunk debugging\n- WAN rules for voice traffic\n- QoS configuration for call quality\n- Enterprise phone system support (multi-vendor)\n- Emergency \"phones down\" resolution under pressure\n\nMICROSOFT 365 & CLOUD:\n- M365 Administration: Exchange Online, SharePoint, Teams, OneDrive\n- Microsoft Defender for Office 365\n- Azure AD basics, Intune fundamentals\n- CSP licensing and tenant management\n- SPF/DKIM/DMARC email authentication\n- AWS (VPS configuration for pen testing)\n\nBACKUP & DISASTER RECOVERY:\n- Veeam Backup & Replication\n- Backblaze B2 with Object Lock (ransomware protection)\n- Backup strategy design, retention policies, restore testing\n- Synology NAS as backup repository\n\nSECURITY & PENETRATION TESTING:\n- Metasploit framework (professional pen testing experience)\n- Network vulnerability assessment\n- AWS VPS configuration for security testing\n- Endpoint protection (BitDefender GravityZone, Microsoft Defender)\n- MFA implementation, security awareness\n- Security-first mindset from early self-teaching\n\nTOOLS & AUTOMATION:\n- RMM: N-Able (deployment, monitoring, remote access)\n- Python scripting and automation\n- n8n workflow automation\n- AI/LLM integration (Claude API, workflow design)\n- Invoicing: Square\n- Documentation: Network diagrams, runbooks, quick reference cards\n\n=============================================================================\nPERSONAL PROJECTS & TECHNICAL BACKGROUND\n=============================================================================\n\nAUTONOMOUS JOB APPLICATION AGENT (Current Project - 2025)\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nBuilt a fully autonomous system that scrapes job postings, scores them for \nrelevance using AI, generates tailored resumes/cover letters, and will \neventually auto-apply. THIS APPLICATION WAS GENERATED BY THAT SYSTEM.\n\nArchitecture:\n\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510   \u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510   \u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510   \u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510\n\u2502 Scrape  \u2502 \u2192 \u2502  Score  \u2502 \u2192 \u2502Generate \u2502 \u2192 \u2502  Apply  \u2502\n\u2502 JobSpy  \u2502   \u2502  Haiku  \u2502   \u2502 Opus4.5 \u2502   \u2502Comp.Use \u2502\n\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518   \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518   \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518   \u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518\n\nTech Stack:\n- Python (JobSpy for scraping, proxy rotation)\n- n8n workflow automation (self-hosted on Hetzner VPS)\n- Claude AI: Haiku for job scoring, Opus 4.5 for document generation\n- Gotenberg for HTML-to-PDF conversion\n- Docker containerization\n- Deduplication system (job ID, URL, company+title hash)\n- Queue management (pending, applied, failed, manual)\n\nDemonstrates: API integration, workflow design, cost optimization\n(using cheaper models where appropriate), error handling, systems thinking.\n\nGitHub: github.com/brandonrz369/job-agent\n\nCRAIGSLIST SCRAPER WITH PROXY ROTATION\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n- Built Python scraper aligned with skillsets\n- Scrapes Craigslist for opportunities\n- Implements proxy switching to avoid rate limiting\n- Built with AI assistance\n\nGITHUB PROJECTS (github.com/brandonrz369)\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n1. pokerresearch - C++/Python Poker HUD & Strategy Agent\n   - Prototypes a poker heads-up display and action-recommendation agent\n   - Features: state ingestion, game modeling, baseline strategies, overlay\n   - Includes hooks for LLM integration (pointing HUD at internal LLM)\n   - Dataset helpers for research\n   - University of Nevada research project\n\n2. lbcom & smart-services-it - Business Websites\n   - Full Next.js/Tailwind CSS website templates\n   - Clone, install, customize, deploy workflow\n   - Deployment to Vercel or Netlify\n   - Custom domain configuration\n\n3. Gemini-Scraper\n   - Python-dominated scraper project\n   - Includes Python and C/Cython code\n   - Associated site hosted on Vercel\n\n4. gravy-scraper & gravybaby\n   - Python automation/scraping tools\n   - Job board scraping with proxy rotation\n\n5. Other repositories:\n   - powerpoint - Firebase tools setup\n   - mar - Project with Anthropic Claude assistance\n\nXDA DEVELOPERS CONTRIBUTIONS (2013-2015) - Age 16\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n[1] N.E.O.N. R.O.M. - Verizon Galaxy Note 3 (Build 3 Version 5)\n    Started December 2, 2013 in Android Development section\n    \n    - Created custom ROM described as \"go-to\" option for users seeking \n      \"tweaked, slim, stock, fast rom with OUTSTANDING battery life\"\n    - Removed 189 pre-installed apps (717 MB saved)\n    - Sub-500MB ROM, Knox-free\n    - Disabled Samsung annoyances\n    - Added AOSP-themed features:\n      * ICS-style icons\n      * 4.4 sound pack\n      * AOSP lock screen\n    - Suite of performance tweaks:\n      * 5\u00d75 launcher with 6-icon dock\n      * Sound-boost hack\n      * Infinite launcher scroll\n      * Disabled scrolling cache for smoother performance\n    - Pre-rooted with BusyBox, zipalignment, init.d support\n    - Credited collaborators (sbreen94, foreverloco, XzxBATTxzX, AngryManMLS)\n    - Provided download links for ROM, add-on theme, Samsung camera module\n    - Maintained updates and community support\n\n[2] Petition to Unlock Bootloader (October 20, 2013)\n    - Organized community petition urging Samsung and Verizon to unlock \n      Galaxy Note 3 bootloader\n    - Encouraged users to sign Change.org petition\n    - Listed executive names, phone numbers, and email addresses for \n      direct pressure campaign\n    - Community activism for user freedom\n\n[3] Safestrap Installation Guide (November 11, 2013)\n    - Authored detailed guide explaining how to install custom ROMs over \n      stock partition without wasting space or triggering Knox\n    - Specified prerequisites: rooted N900V, Safestrap v3.62, Odin\n    - Step-by-step instructions for backup, ROM slot creation, restoration\n\n[4] Note 3 KitKat Root Guide (June 16, 2014)\n    - Shared instructions on using Geohot's Towelroot exploit\n    - Root on Note 3 running Android 4.4.2\n    - Concise, accessible instructions for community\n\n[5] HTC One M8 S-OFF Guide Contribution (October 18, 2015)\n    - Sought and shared advice on updating firmware while preserving \n      S-OFF status and user data\n\nSUMMARY OF XDA CONTRIBUTIONS:\n- Demonstrates deep technical curiosity at age 16\n- Documentation skills - created guides others could follow\n- Community contribution and collaboration\n- System optimization and customization\n- Activism for user rights and device freedom\n\nORIGIN STORY\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\nSelf-taught from necessity. As a teenager with an overbearing mother, \ntechnology became my outlet. When I had issues with parental controls, I \ninstalled Linux or other tools to remove them. When we didn't have WiFi \nanymore, I bought an antenna off eBay and burned a Linux distro to access \nneighbors' networks. Got really good at it too.\n\nThis problem-solving mindset - finding technical solutions to real \nconstraints - has defined my approach to IT ever since. I don't wait for \npermission or training; I figure it out.\n\n=============================================================================\nWHAT MAKES ME DIFFERENT\n=============================================================================\n\n1. PROMOTED AT 18: Moved to escalation team at Fusion handling tickets that\n   stumped experienced techs. Employers recognized my abilities early.\n\n2. SECURITY BACKGROUND: Professional pen testing contract at 18. Self-taught\n   from childhood. I think like an attacker, defend like a pro.\n\n3. MULTI-VENDOR FIREWALL FLUENCY: Cisco, Fortinet, SonicWall, Palo Alto, \n   Meraki, pfSense - all in production environments. Not just one vendor.\n\n4. ENTREPRENEURIAL: Built a real MSP, won a $17K contract, handled emergency\n   outages where businesses were losing money. I understand business impact.\n\n5. VOIP UNDER PRESSURE: When 50 phones go down and a business is paralyzed,\n   I've been the one isolating SIP issues. I know 8x8 inside and out.\n\n6. FULL STACK: Help desk to pen testing to MSP owner. I've worked every \n   level and understand how they connect.\n\n7. DOCUMENTATION OBSESSED: I create network diagrams, runbooks, and quick\n   reference cards because good documentation prevents 3am emergencies.\n\n8. BUILDS TOOLS: Not just uses them. This job application came from an\n   AI-powered system I built myself. That's how I approach problems.\n\n9. ROM DEVELOPER AT 16: Was publishing custom Android ROMs with thousands\n   of downloads while still in high school. Deep technical curiosity.\n\n10. WORKS HARD: Maintained IT career development while working supervisor,\n    warehouse, and gig jobs. Whatever it takes.\n\n=============================================================================\nEDUCATION & CERTIFICATIONS\n=============================================================================\n- Currently studying for AWS Cloud Practitioner\n- Continuous self-education via documentation, labs, and real-world projects\n- No formal degree - 100% self-taught and battle-tested\n\n=============================================================================\n```\n=== TARGET JOB ===\nCompany: {{ $json.company }}\nTitle: {{ $json.title }}\nLocation: {{ $json.location }}\nDescription: {{ $json.description }}\n\n=== INSTRUCTIONS ===\nWrite a compelling 1-page cover letter for this specific job. Show why I'm a great fit. Include the meta-play: mention this application was generated by my autonomous job agent. Be genuine, not generic. End with: \"Full transparency: This application was generated by an autonomous job agent I built.\" Return ONLY valid HTML with inline CSS. No markdown. No code blocks.\n```"
+            }
+          ]
+        },
+        "simplify": false,
+        "options": {
+          "maxTokens": 4096
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [
+        -32,
+        256
+      ],
+      "id": "0cde22d0-f845-48e5-be13-985c8ac76e14",
+      "name": "Cover Letter Writer",
+      "credentials": {
+        "anthropicApi": {
+          "id": "r594dWEDlk4qY8Ok",
+          "name": "Anthropic account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const resumeData = $input.first().json;\nconst jobData = $('Counter').first().json;\n\n// Get HTML - adjust based on Simplify Output setting\nlet resumeHtml = resumeData.message || resumeData.content?.[0]?.text || resumeData.text || JSON.stringify(resumeData);\n\n// Clean markdown code blocks\nresumeHtml = resumeHtml.replace(/```html\\n?/gi, '').replace(/```\\n?/gi, '').trim();\n\n// Ensure valid HTML wrapper\nif (!resumeHtml.toLowerCase().includes('<!doctype') && !resumeHtml.toLowerCase().includes('<html')) {\n  resumeHtml = `<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><title>Resume - Brandon Ruiz</title></head><body>${resumeHtml}</body></html>`;\n}\n\n// Clean company name for filename\nconst company = (jobData.company || 'Unknown')\n  .replace(/[^a-zA-Z0-9\\s]/g, '')\n  .replace(/\\s+/g, '_')\n  .substring(0, 30);\n\nconst appNum = jobData.application_number;\n\n// Create binary data for Gotenberg\nconst resumeBinary = await this.helpers.prepareBinaryData(\n  Buffer.from(resumeHtml, 'utf-8'),\n  'index.html',\n  'text/html'\n);\n\nreturn [{\n  json: {\n    company: company,\n    application_number: appNum,\n    resume_filename: `${company}_${appNum}_Resume.pdf`\n  },\n  binary: {\n    data: resumeBinary\n  }\n}];"
+      },
+      "id": "706fc21c-ac30-456d-8c28-d37219b8b796",
+      "name": "Prepare HTML1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        272,
+        224
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Counter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Counter": {
+      "main": [
+        [
+          {
+            "node": "Resume Writer1",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Cover Letter Writer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare HTML": {
+      "main": [
+        [
+          {
+            "node": "PDF Resume",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PDF Resume": {
+      "main": [
+        [
+          {
+            "node": "Save Resume",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PDF Cover": {
+      "main": [
+        [
+          {
+            "node": "Save Cover",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Resume": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Cover": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resume Writer1": {
+      "main": [
+        [
+          {
+            "node": "Prepare HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cover Letter Writer": {
+      "main": [
+        [
+          {
+            "node": "Prepare HTML1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare HTML1": {
+      "main": [
+        [
+          {
+            "node": "PDF Cover",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

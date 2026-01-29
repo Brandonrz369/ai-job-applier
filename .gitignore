@@ -1,0 +1,39 @@
+# Environment and secrets
+.env
+*.env
+.env.*
+
+# Credentials and authentication
+agent/accounts.json
+config/google_accounts.json
+agent/cookies*.json
+agent/storage_state*.json
+
+# Virtual environments
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime state
+queue/*.json
+
+# Output files (generated at runtime)
+logs/
+output/
+screenshots/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.save
