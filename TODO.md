@@ -7,10 +7,10 @@ Track progress here. Check off items as completed.
 ## Phase 1: Form Injection (HIGH IMPACT)
 *Goal: Reduce 40 steps → 3-5 steps*
 
-- [ ] **1.1** Create `skills/form_filler.js` - React-aware injection script
-- [ ] **1.2** Create `skills/dom_parser.py` - HTML cleaner for LLM input
-- [ ] **1.3** Add `inject_form` action to controller
-- [ ] **1.4** Add heuristic field matching (regex for name/email/phone)
+- [x] **1.1** Create `skills/form_filler.js` - React-aware injection script
+- [x] **1.2** Create `skills/dom_parser.py` - HTML cleaner for LLM input
+- [x] **1.3** Add `inject_form_data` action to controller
+- [x] **1.4** Add heuristic field matching (regex for name/email/phone)
 - [ ] **1.5** Test on Indeed Easy Apply form
 - [ ] **1.6** Test on Greenhouse form
 

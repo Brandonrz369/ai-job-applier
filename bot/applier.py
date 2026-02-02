@@ -153,6 +153,121 @@ async def humanize_form_field(browser_session: BrowserSession, field_selector: s
         return ActionResult(extracted_content=f"Humanize error: {str(e)}")
 
 
+# ============ FORM INJECTION SYSTEM ============
+# Load the form filler JS
+FORM_FILLER_JS = Path("/root/job_bot/skills/form_filler.js").read_text()
+
+# Import DOM parser
+import sys
+sys.path.insert(0, "/root/job_bot")
+from skills.dom_parser import clean_html_for_llm, generate_field_mapping, extract_form_fields, match_field_heuristically
+
+
+@controller.action('Inject form data - fill ALL fields at once using JS injection (much faster than clicking each field)')
+async def inject_form_data(browser_session: BrowserSession) -> ActionResult:
+    """
+    SPEED OPTIMIZATION: Fill entire form in one step instead of clicking each field.
+
+    1. Extracts form HTML
+    2. Maps fields to user profile using heuristics (free) then LLM if needed
+    3. Injects all values via React-aware JavaScript
+    4. Returns list of filled fields and any that need manual handling (files)
+    """
+    try:
+        page = await browser_session.get_current_page()
+        if not page:
+            return ActionResult(extracted_content="Could not get current page")
+
+        # Get form HTML
+        form_html = await page.evaluate("""() => {
+            const form = document.querySelector('form');
+            if (form) return form.outerHTML;
+            // No form tag - get body content with inputs
+            return document.body.innerHTML;
+        }""")
+
+        if not form_html or len(form_html) < 50:
+            return ActionResult(extracted_content="No form found on page")
+
+        # User profile for mapping
+        user_profile = {
+            'first_name': APPLICANT['name'].split()[0],
+            'last_name': APPLICANT['name'].split()[-1] if len(APPLICANT['name'].split()) > 1 else '',
+            'email': APPLICANT['email'],
+            'phone': APPLICANT['phone'],
+            'city': APPLICANT.get('city', 'Anaheim'),
+            'state': APPLICANT.get('state', 'CA'),
+            'zip': APPLICANT.get('zip_code', '92805'),
+            'address': APPLICANT.get('street_address', ''),
+            'linkedin': 'linkedin.com/in/brandonruiz',
+        }
+
+        # Generate field mapping (heuristics first, then LLM if needed)
+        def llm_callback(unmatched_fields, profile):
+            # Use Gemini Flash for quick field mapping
+            if not GEMINI_AVAILABLE:
+                return {}
+            try:
+                client = genai.Client(api_key=GEMINI_API_KEY)
+                fields_desc = "\n".join([f"- {f.get('name') or f.get('id') or f.get('placeholder')}: {f.get('type')}" for f in unmatched_fields])
+                prompt = f"""Map these form fields to user profile values. Return JSON only.
+
+Fields:
+{fields_desc}
+
+Profile: {json.dumps(profile)}
+
+Return format: {{"selector": "value", ...}}
+Use CSS selectors like [name="fieldname"] or #id"""
+
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                    config={'temperature': 0.1}
+                )
+                # Parse JSON from response
+                text = response.text or ""
+                match = re.search(r'\{[^}]+\}', text, re.DOTALL)
+                if match:
+                    return json.loads(match.group())
+            except Exception as e:
+                print(f"  [Form Injection] LLM mapping error: {e}")
+            return {}
+
+        field_mapping = generate_field_mapping(form_html, user_profile, llm_callback)
+
+        if not field_mapping:
+            return ActionResult(extracted_content="Could not generate field mapping. Use manual form filling.")
+
+        # Inject the form filler function and execute it
+        injection_script = f"""
+        {FORM_FILLER_JS}
+
+        return await injectFormData({json.dumps(field_mapping)});
+        """
+
+        result = await page.evaluate(injection_script)
+
+        filled = result.get('filled', [])
+        failed = result.get('failed', [])
+        files = result.get('files', [])
+
+        summary = f"Filled {len(filled)} fields"
+        if failed:
+            summary += f", {len(failed)} not found"
+        if files:
+            summary += f", {len(files)} file uploads needed"
+
+        print(f"  [Form Injection] {summary}")
+
+        return ActionResult(
+            extracted_content=f"FORM INJECTED: {summary}. Fields filled: {', '.join(filled[:5])}{'...' if len(filled) > 5 else ''}"
+        )
+
+    except Exception as e:
+        return ActionResult(extracted_content=f"Form injection error: {str(e)}")
+
+
 @controller.action('Solve CAPTCHA (Cloudflare Turnstile, reCAPTCHA, or hCaptcha)')
 async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
     """Detect and solve CAPTCHAs using CapSolver API - supports Turnstile, reCAPTCHA, and hCaptcha"""
