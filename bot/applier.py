@@ -1,61 +1,824 @@
 """
 Job Application Agent using Browser-Use Cloud with US residential proxy
 Focuses on Indeed Easy Apply only
+
+IMPROVEMENTS (Feb 2026):
+- Added hCaptcha support
+- Fixed success detection (accepts variations)
+- Added domain blocklist for complex ATS
+- Added NaN/bad data filtering
+- Switched to async aiohttp for CAPTCHA solving
+- GEMINI RESCUE SYSTEM: Call Gemini when agent is stuck
 """
 import asyncio
 import json
 import re
 import time
+import base64
 from pathlib import Path
 from dotenv import load_dotenv
 import os
+import aiohttp
+
+# Gemini for "Rescue" system
+try:
+    from google import genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
 
 # Load environment variables
 load_dotenv(Path("/root/job_bot/agent/.env"))
 
 # Browser-Use imports
-from browser_use import Agent
+from browser_use import Agent, Controller
+from browser_use.agent.views import ActionResult
 from browser_use.browser.profile import BrowserProfile, ProxySettings
 from browser_use.browser.session import BrowserSession
 
 # SDK for cloud file uploads
 from browser_use_sdk import AsyncBrowserUse
-import aiohttp
+
+# ============ CAPSOLVER CONFIG ============
+CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
+
+# ============ BLOCKED DOMAINS (Complex ATS - skip these) ============
+BLOCKED_ATS_DOMAINS = [
+    'myworkdayjobs.com',
+    'myworkday.com',
+    'wd1.myworkdayjobs.com',
+    'wd3.myworkdayjobs.com',
+    'wd5.myworkdayjobs.com',
+    'icims.com',
+    'taleo.net',
+    'oraclecloud.com',
+    'brassring.com',
+    'ultipro.com',
+    'successfactors.com',  # Can work but often problematic
+]
+
+# ============ SUCCESS KEYWORDS (flexible matching) ============
+SUCCESS_KEYWORDS = [
+    'application submitted',
+    'application has been submitted',
+    'application sent',
+    'application has been sent',
+    'your application has been sent',
+    'thank you for applying',
+    'thanks for applying',
+    'successfully applied',
+    'received your application',
+    'application received',
+    'application complete',
+    'congratulations',
+    'we have received your application',
+    'your application was submitted',
+    'application successfully submitted',
+    'you have successfully applied',
+    'success!',
+    'applied successfully',
+]
+
+# Job unavailable indicators (fast-fail)
+JOB_UNAVAILABLE_KEYWORDS = [
+    'job has expired',
+    'job is no longer available',
+    'no longer accepting applications',
+    'job not found',
+    'this job post is no longer available',
+    'position has been filled',
+    'job listing has expired',
+    'this position is closed',
+]
+
+# Create controller with CAPTCHA solving action
+controller = Controller()
+
+import random
+
+# ============ HUMAN-LIKE BEHAVIOR HELPERS ============
+async def human_delay(min_ms=100, max_ms=500):
+    """Random delay to simulate human hesitation"""
+    delay = random.randint(min_ms, max_ms) / 1000
+    await asyncio.sleep(delay)
+
+async def human_type(page, selector: str, text: str):
+    """Type text with human-like variable speed"""
+    element = await page.query_selector(selector)
+    if element:
+        await element.click()
+        await human_delay(50, 200)
+        for char in text:
+            await element.type(char, delay=random.randint(30, 120))
+            if random.random() < 0.1:  # 10% chance of pause
+                await human_delay(100, 300)
+
+
+@controller.action('Humanize form interaction - dispatch events after clicking (use after radio/checkbox clicks)')
+async def humanize_form_field(browser_session: BrowserSession, field_selector: str = "") -> ActionResult:
+    """
+    Call this after clicking a radio button, checkbox, or dropdown to ensure React/Vue registers the change.
+    Also adds human-like delay.
+    """
+    try:
+        page = await browser_session.get_current_page()
+        if not page:
+            return ActionResult(extracted_content="Could not get current page")
+
+        # Add human-like delay
+        await human_delay(200, 600)
+
+        # Dispatch events on recently clicked elements
+        await page.evaluate("""() => {
+            // Find all recently focused/clicked form elements
+            const inputs = document.querySelectorAll('input:focus, input:checked, select, [aria-selected="true"]');
+            inputs.forEach(el => {
+                // Dispatch full set of events React/Vue expect
+                el.dispatchEvent(new Event('focus', { bubbles: true }));
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
+            });
+
+            // Also try to trigger form validation
+            const form = document.querySelector('form');
+            if (form) {
+                form.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+        }""")
+
+        return ActionResult(extracted_content="Form events dispatched. Form should now recognize the selection.")
+
+    except Exception as e:
+        return ActionResult(extracted_content=f"Humanize error: {str(e)}")
+
+
+@controller.action('Solve CAPTCHA (Cloudflare Turnstile, reCAPTCHA, or hCaptcha)')
+async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
+    """Detect and solve CAPTCHAs using CapSolver API - supports Turnstile, reCAPTCHA, and hCaptcha"""
+    if not CAPSOLVER_API_KEY:
+        return ActionResult(extracted_content="No CAPSOLVER_API_KEY configured")
+
+    try:
+        # Get the current page from browser session
+        page = await browser_session.get_current_page()
+        if not page:
+            return ActionResult(extracted_content="Could not get current page")
+
+        # Get URL via JavaScript
+        page_url = await page.evaluate("() => window.location.href")
+
+        async with aiohttp.ClientSession() as http_client:
+            # ============ 1. Detect CAPTCHA Type ============
+            captcha_type = None
+            site_key = None
+
+            # Check for hCaptcha FIRST (commonly missed)
+            hcaptcha_elements = await page.get_elements_by_css_selector('.h-captcha, iframe[src*="hcaptcha"], [data-hcaptcha-widget-id]')
+            if hcaptcha_elements:
+                print(f"  [CapSolver] hCaptcha detected on {page_url[:50]}...")
+                site_key = await page.evaluate("""
+                    () => {
+                        const el = document.querySelector('.h-captcha, [data-sitekey]');
+                        if (el) return el.getAttribute('data-sitekey');
+                        // Try iframe src
+                        const frame = document.querySelector('iframe[src*="hcaptcha"]');
+                        if (frame) {
+                            const match = frame.src.match(/sitekey=([^&]+)/);
+                            return match ? match[1] : null;
+                        }
+                        return null;
+                    }
+                """)
+                if site_key:
+                    captcha_type = "HCaptchaTaskProxyLess"
+
+            # Check for Cloudflare Turnstile
+            if not captcha_type:
+                turnstile_elements = await page.get_elements_by_css_selector('iframe[src*="challenges.cloudflare.com"], [data-turnstile-sitekey], .cf-turnstile')
+                if turnstile_elements:
+                    print(f"  [CapSolver] Cloudflare Turnstile detected on {page_url[:50]}...")
+                    site_key = await page.evaluate("""
+                        () => {
+                            const el = document.querySelector('[data-turnstile-sitekey], .cf-turnstile');
+                            if (el) return el.getAttribute('data-turnstile-sitekey') || el.getAttribute('data-sitekey');
+                            const iframe = document.querySelector('iframe[src*="challenges.cloudflare.com"]');
+                            if (iframe) {
+                                const match = iframe.src.match(/[?&]k=([^&]+)/);
+                                return match ? match[1] : null;
+                            }
+                            return null;
+                        }
+                    """)
+                    if site_key:
+                        captcha_type = "AntiTurnstileTaskProxyLess"
+
+            # Check for reCAPTCHA v2
+            if not captcha_type:
+                recaptcha_elements = await page.get_elements_by_css_selector('.g-recaptcha, [data-sitekey], iframe[src*="recaptcha"]')
+                if recaptcha_elements:
+                    print(f"  [CapSolver] reCAPTCHA detected on {page_url[:50]}...")
+                    site_key = await page.evaluate("""
+                        () => {
+                            const el = document.querySelector('.g-recaptcha, [data-sitekey]');
+                            if (el) return el.getAttribute('data-sitekey');
+                            const iframe = document.querySelector('iframe[src*="recaptcha"]');
+                            if (iframe) {
+                                const match = iframe.src.match(/[?&]k=([^&]+)/);
+                                return match ? match[1] : null;
+                            }
+                            return null;
+                        }
+                    """)
+                    if site_key:
+                        captcha_type = "ReCaptchaV2TaskProxyLess"
+
+            if not captcha_type or not site_key:
+                return ActionResult(extracted_content="No supported CAPTCHA found or sitekey missing")
+
+            # ============ 2. Create Task (async) ============
+            print(f"  [CapSolver] Creating task: {captcha_type} with key {site_key[:20]}...")
+
+            payload = {
+                "clientKey": CAPSOLVER_API_KEY,
+                "task": {
+                    "type": captcha_type,
+                    "websiteURL": page_url,
+                    "websiteKey": site_key
+                }
+            }
+
+            async with http_client.post("https://api.capsolver.com/createTask", json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                data = await resp.json()
+                task_id = data.get("taskId")
+                if not task_id:
+                    return ActionResult(extracted_content=f"Task creation failed: {data.get('errorDescription', data)}")
+
+            print(f"  [CapSolver] Task created: {task_id}")
+
+            # ============ 3. Poll for Result (async) ============
+            solution = None
+            for i in range(24):  # 120 seconds max
+                await asyncio.sleep(5)
+                async with http_client.post("https://api.capsolver.com/getTaskResult",
+                                           json={"clientKey": CAPSOLVER_API_KEY, "taskId": task_id},
+                                           timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    result = await resp.json()
+
+                    if result.get("status") == "ready":
+                        solution = result.get("solution", {}).get("gRecaptchaResponse") or \
+                                   result.get("solution", {}).get("token")
+                        break
+                    elif result.get("status") == "failed":
+                        return ActionResult(extracted_content=f"Solving failed: {result.get('errorDescription')}")
+
+                    print(f"  [CapSolver] Waiting... ({i*5}s)")
+
+            if not solution:
+                return ActionResult(extracted_content="Timeout waiting for CAPTCHA solution")
+
+            print(f"  [CapSolver] Got solution! Injecting...")
+
+            # ============ 4. Inject Solution ============
+            escaped_solution = solution.replace("'", "\\'").replace("\n", "\\n")
+
+            if captcha_type == "HCaptchaTaskProxyLess":
+                await page.evaluate(f"""
+                    () => {{
+                        const token = '{escaped_solution}';
+                        // Update hidden textareas
+                        const fields = document.querySelectorAll('[name="h-captcha-response"], [name="g-recaptcha-response"]');
+                        fields.forEach(el => {{
+                            el.value = token;
+                            // Dispatch events for React/Vue forms
+                            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        }});
+                        // Try callback
+                        if (window.hcaptcha) {{
+                            const widget = document.querySelector('.h-captcha');
+                            if (widget && widget.getAttribute('data-callback')) {{
+                                const cbName = widget.getAttribute('data-callback');
+                                if (typeof window[cbName] === 'function') window[cbName](token);
+                            }}
+                        }}
+                        // Also try global hcaptcha callback
+                        if (typeof window.onHCaptchaSuccess === 'function') {{
+                            window.onHCaptchaSuccess(token);
+                        }}
+                    }}
+                """)
+                print(f"  [CapSolver] hCaptcha solved successfully!")
+                return ActionResult(extracted_content="CAPTCHA solved - hCaptcha token injected. Click verify/submit.")
+
+            elif captcha_type == "AntiTurnstileTaskProxyLess":
+                await page.evaluate(f"""
+                    () => {{
+                        const token = '{escaped_solution}';
+                        const responseField = document.querySelector('[name="cf-turnstile-response"]') ||
+                                             document.querySelector('input[name*="turnstile"]');
+                        if (responseField) {{
+                            responseField.value = token;
+                            // Dispatch events for React/Vue forms
+                            responseField.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            responseField.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        }}
+                        // Try Turnstile callback
+                        if (window.turnstile && window.turnstile.getResponse) {{
+                            // Turnstile widget exists
+                        }}
+                        // Check for custom callback
+                        const widget = document.querySelector('.cf-turnstile');
+                        if (widget && widget.getAttribute('data-callback')) {{
+                            const cbName = widget.getAttribute('data-callback');
+                            if (typeof window[cbName] === 'function') window[cbName](token);
+                        }}
+                    }}
+                """)
+                print(f"  [CapSolver] Turnstile solved successfully!")
+                return ActionResult(extracted_content="CAPTCHA solved - Turnstile bypassed. Refresh or click verify.")
+
+            elif captcha_type == "ReCaptchaV2TaskProxyLess":
+                await page.evaluate(f"""
+                    () => {{
+                        const token = '{escaped_solution}';
+                        const responseFields = document.querySelectorAll('[name="g-recaptcha-response"], #g-recaptcha-response, textarea[id*="recaptcha-response"]');
+                        responseFields.forEach(field => {{
+                            field.value = token;
+                            field.innerHTML = token;
+                            // Dispatch events for React/Vue forms
+                            field.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            field.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        }});
+                        // Try callbacks
+                        if (typeof ___grecaptcha_cfg !== 'undefined' && ___grecaptcha_cfg.clients) {{
+                            Object.keys(___grecaptcha_cfg.clients).forEach(key => {{
+                                const client = ___grecaptcha_cfg.clients[key];
+                                if (client) {{
+                                    ['callback', 'O', 'response'].forEach(prop => {{
+                                        if (client[prop] && typeof client[prop] === 'function') {{
+                                            try {{ client[prop](token); }} catch(e) {{}}
+                                        }}
+                                    }});
+                                    // Also check nested objects
+                                    Object.keys(client).forEach(subKey => {{
+                                        const sub = client[subKey];
+                                        if (sub && typeof sub === 'object') {{
+                                            ['callback', 'O'].forEach(prop => {{
+                                                if (sub[prop] && typeof sub[prop] === 'function') {{
+                                                    try {{ sub[prop](token); }} catch(e) {{}}
+                                                }}
+                                            }});
+                                        }}
+                                    }});
+                                }}
+                            }});
+                        }}
+                        // Also try grecaptcha global callback
+                        if (typeof grecaptcha !== 'undefined' && grecaptcha.callback) {{
+                            try {{ grecaptcha.callback(token); }} catch(e) {{}}
+                        }}
+                        // IMPROVEMENT: Click the checkbox to trigger visual update
+                        const checkbox = document.querySelector('.recaptcha-checkbox-border, .recaptcha-checkbox, [role="checkbox"]');
+                        if (checkbox) checkbox.click();
+                    }}
+                """)
+                print(f"  [CapSolver] reCAPTCHA solved successfully!")
+                # Also try clicking the checkbox via Playwright for extra reliability
+                try:
+                    checkbox = await page.query_selector('.recaptcha-checkbox-border, .recaptcha-checkbox')
+                    if checkbox:
+                        await checkbox.click()
+                        print(f"  [CapSolver] Clicked reCAPTCHA checkbox")
+                except:
+                    pass
+                return ActionResult(extracted_content="CAPTCHA solved - reCAPTCHA token injected and checkbox clicked. Submit button should now be enabled.")
+
+            return ActionResult(extracted_content=f"Solution injected for {captcha_type}")
+
+    except Exception as e:
+        return ActionResult(extracted_content=f"CAPTCHA solving error: {str(e)}")
+
+
+# ============ URL GUARD - Stop if leaving Indeed ============
+ALLOWED_DOMAINS = ['indeed.com', 'indeed.co', 'indeed.ca', 'indeed.co.uk']
+EXTERNAL_ATS_INDICATORS = ['greenhouse.io', 'lever.co', 'workday', 'icims.com', 'taleo', 'brassring', 'ultipro', 'successfactors', 'oraclecloud']
+
+
+@controller.action('Check if still on Indeed Easy Apply (IMPORTANT: Call this before clicking Apply)')
+async def verify_indeed_easy_apply(browser_session: BrowserSession) -> ActionResult:
+    """
+    CRITICAL: Verifies we are still on Indeed and this is a true Easy Apply job.
+    If redirected to external site, returns ABORT instruction.
+    """
+    try:
+        page = await browser_session.get_current_page()
+        if not page:
+            return ActionResult(extracted_content="Could not get current page")
+
+        current_url = await page.evaluate("() => window.location.href")
+        url_lower = current_url.lower()
+
+        # Check if we left Indeed
+        is_on_indeed = any(domain in url_lower for domain in ALLOWED_DOMAINS)
+
+        if not is_on_indeed:
+            # Check which external ATS we landed on
+            for ats in EXTERNAL_ATS_INDICATORS:
+                if ats in url_lower:
+                    return ActionResult(
+                        extracted_content=f"ABORT: Redirected to external ATS ({ats}). Say 'EXTERNAL_SITE' and stop."
+                    )
+            return ActionResult(
+                extracted_content=f"ABORT: Left Indeed domain. Current URL: {current_url[:80]}. Say 'EXTERNAL_SITE' and stop."
+            )
+
+        # Check if the button says "Apply on company site" (not true Easy Apply)
+        is_external_button = await page.evaluate("""() => {
+            const buttons = document.querySelectorAll('button, a');
+            for (const btn of buttons) {
+                const text = btn.innerText.toLowerCase();
+                if (text.includes('apply on company site') || text.includes('apply externally')) {
+                    return true;
+                }
+            }
+            return false;
+        }""")
+
+        if is_external_button:
+            return ActionResult(
+                extracted_content="WARNING: This job requires 'Apply on company site'. NOT Easy Apply. Consider skipping."
+            )
+
+        return ActionResult(extracted_content="CONFIRMED: On Indeed, appears to be Easy Apply. Proceed with application.")
+
+    except Exception as e:
+        return ActionResult(extracted_content=f"URL check error: {str(e)}")
+
+
+@controller.action('Check for form validation errors before clicking Continue/Submit')
+async def check_validation_errors(browser_session: BrowserSession) -> ActionResult:
+    """
+    CRITICAL: Call this BEFORE clicking Continue/Submit/Apply.
+    Scans for validation errors, red text, empty required fields.
+    Also checks inside iframes (Indeed Easy Apply uses iframes).
+    """
+    try:
+        page = await browser_session.get_current_page()
+        if not page:
+            return ActionResult(extracted_content="Could not get current page")
+
+        errors = await page.evaluate("""() => {
+            function getErrors(doc) {
+                let foundErrors = [];
+
+                // 1. Check for HTML5 validation errors
+                const invalidInputs = doc.querySelectorAll('input:invalid, select:invalid, textarea:invalid');
+                if (invalidInputs.length > 0) {
+                    foundErrors.push(`${invalidInputs.length} invalid HTML inputs`);
+                }
+
+                // 2. Check for ARIA invalid attributes (React apps)
+                const ariaInvalid = doc.querySelectorAll('[aria-invalid="true"]');
+                ariaInvalid.forEach(f => {
+                    const label = f.getAttribute('aria-label') || f.placeholder || f.name || 'field';
+                    foundErrors.push(`Invalid: ${label}`);
+                });
+
+                // 3. Check for error classes (visible only)
+                const errorElements = doc.querySelectorAll('[class*="error"], [class*="Error"], [class*="alert-danger"], [class*="invalid"]');
+                errorElements.forEach(el => {
+                    const text = el.innerText.trim();
+                    if (text.length > 2 && text.length < 150 && el.offsetParent !== null) {
+                        foundErrors.push(`Error: ${text.substring(0, 60)}`);
+                    }
+                });
+
+                // 4. Check for red "Required" text
+                const spans = doc.querySelectorAll('span, div, p');
+                for (let el of spans) {
+                    try {
+                        const style = window.getComputedStyle(el);
+                        const color = style.color;
+                        if ((color.includes('rgb(2') || color.includes('red')) &&
+                            (el.innerText.includes('Required') || el.innerText.includes('fix the error'))) {
+                            foundErrors.push(`Required warning: ${el.innerText.substring(0, 50)}`);
+                        }
+                    } catch(e) {}
+                }
+
+                // 5. Check for empty required fields
+                const requiredFields = doc.querySelectorAll('[required], [aria-required="true"]');
+                requiredFields.forEach(f => {
+                    if (!f.value || f.value.trim() === '') {
+                        const label = f.getAttribute('aria-label') || f.placeholder || f.name || 'field';
+                        foundErrors.push(`Empty required: ${label}`);
+                    }
+                });
+
+                return foundErrors;
+            }
+
+            // Check main document
+            let report = getErrors(document);
+
+            // Check iframes (Indeed Easy Apply uses iframes)
+            const frames = document.querySelectorAll('iframe');
+            frames.forEach(frame => {
+                try {
+                    const frameDoc = frame.contentDocument || frame.contentWindow.document;
+                    if (frameDoc) {
+                        const frameErrors = getErrors(frameDoc);
+                        frameErrors.forEach(e => report.push(`(iframe) ${e}`));
+                    }
+                } catch (e) {
+                    // Cross-origin restriction - can't access
+                }
+            });
+
+            return report;
+        }""")
+
+        if errors and len(errors) > 0:
+            # Filter out empty/useless error messages
+            meaningful_errors = [e for e in errors if e and len(e.strip()) > 3 and e.strip() not in [';', '[]', 'Error:', 'Invalid:']]
+            if meaningful_errors:
+                error_list = "; ".join(meaningful_errors[:5])  # First 5 meaningful errors
+                return ActionResult(
+                    extracted_content=f"VALIDATION ERRORS FOUND: {error_list}. FIX THESE before clicking Continue/Submit."
+                )
+
+        return ActionResult(extracted_content="No validation errors detected. Safe to proceed.")
+
+    except Exception as e:
+        return ActionResult(extracted_content=f"Validation check error: {str(e)}")
+
+
+# ============ GEMINI TIERED RESCUE SYSTEM ============
+# Based on Gemini 3 Pro deep analysis recommendations:
+# - Tier 1: Flash with NO thinking for quick tactical fixes
+# - Tier 2: Pro with 4K thinking for complex problems
+# - WAF detection: "Something went wrong" on Indeed = bot block, not logic error
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBqxiFt6z01sHh_nhfvIPAA1o8FPSZrvCA")
+
+# Track rescue attempts per session to implement tiered escalation
+_rescue_attempt_count = {}
+
+
+@controller.action('Ask Gemini for help when stuck (RESCUE MODE - use when confused or stuck in a loop)')
+async def ask_gemini_for_help(browser_session: BrowserSession, problem_description: str = "I am stuck") -> ActionResult:
+    """
+    TIERED RESCUE SYSTEM:
+    - Tier 1 (first call): Gemini Flash, NO thinking - fast tactical fix
+    - Tier 2 (repeat calls): Gemini 3 Pro, 4K thinking - deep analysis
+    - WAF Detection: Identifies bot blocks vs logic errors
+    """
+    global _rescue_attempt_count
+
+    if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
+        return ActionResult(extracted_content="Gemini not available - continue with best guess")
+
+    try:
+        page = await browser_session.get_current_page()
+        if not page:
+            return ActionResult(extracted_content="Could not get current page")
+
+        # Get current URL
+        current_url = await page.evaluate("() => window.location.href")
+
+        # Track attempts for this URL pattern (strip query params for grouping)
+        url_key = current_url.split('?')[0][:50]
+        _rescue_attempt_count[url_key] = _rescue_attempt_count.get(url_key, 0) + 1
+        attempt = _rescue_attempt_count[url_key]
+
+        # Get visible text from the page
+        visible_text = await page.evaluate("""() => {
+            const body = document.body.innerText;
+            return body.substring(0, 2000);
+        }""")
+
+        # Get error messages
+        error_messages = await page.evaluate("""() => {
+            const errors = [];
+            const errorElements = document.querySelectorAll('.error, .invalid, [class*="error"], [aria-invalid="true"]');
+            errorElements.forEach(el => {
+                const text = el.innerText.trim();
+                if (text && text.length < 200 && el.offsetParent !== null) {
+                    errors.push(text);
+                }
+            });
+            return errors.slice(0, 5).join(' | ');
+        }""")
+
+        # Get interactive elements
+        buttons = await page.evaluate("""() => {
+            const btns = document.querySelectorAll('button, input[type="submit"], a[role="button"]');
+            const visible = [];
+            btns.forEach((b, i) => {
+                if (b.offsetParent !== null && i < 10) {
+                    visible.push(b.innerText.trim().substring(0, 30));
+                }
+            });
+            return visible.join(', ');
+        }""")
+
+        # ============ WAF/BOT DETECTION ============
+        # "Something went wrong" on Indeed is usually a WAF block, not logic error
+        error_lower = (error_messages or '').lower()
+        problem_lower = problem_description.lower()
+        is_waf_block = (
+            ('something went wrong' in error_lower or 'something went wrong' in problem_lower) and
+            'indeed' in current_url.lower() and
+            attempt >= 2  # Only flag as WAF after multiple attempts
+        )
+
+        if is_waf_block:
+            print(f"  [GEMINI RESCUE] WAF/Bot detection suspected (attempt {attempt})")
+            return ActionResult(
+                extracted_content="GEMINI ADVICE: STOP: WAF_DETECTED - Indeed bot protection triggered. Save and try another job."
+            )
+
+        # Build context
+        context = f"""URL: {current_url}
+Problem: {problem_description}
+Errors: {error_messages or 'None'}
+Buttons: {buttons or 'None'}
+Page: {visible_text[:1000]}"""
+
+        client = genai.Client(api_key=GEMINI_API_KEY)
+
+        # ============ TIER 1: Fast Tactical (Flash, no thinking) ============
+        if attempt == 1:
+            print(f"  [GEMINI RESCUE] Tier 1: Flash (no thinking)")
+            prompt = f"""UI navigator for job application bot. Quick fix needed.
+
+{context}
+
+Output ONE action: CLICK: [button] / TYPE: [field]=[value] / SCROLL: [up/down] / WAIT: [reason] / STOP: [reason]"""
+
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config={'temperature': 0.2}  # No thinking config = no thinking
+            )
+
+        # ============ TIER 2: Deep Analysis (Pro, 4K thinking) ============
+        else:
+            print(f"  [GEMINI RESCUE] Tier 2: Pro with thinking (attempt {attempt})")
+            prompt = f"""You are debugging a stuck job application bot. Tier 1 fast fix failed.
+
+{context}
+
+DEEP ANALYZE: Why is the form not progressing? Consider:
+- Hidden validation errors
+- Form state not updating (React hydration)
+- Modal/overlay blocking interaction
+- Wrong element being clicked
+
+Output ONE action: CLICK: [button] / TYPE: [field]=[value] / SCROLL: [up/down] / WAIT: [reason] / STOP: [reason]
+Only STOP if truly unrecoverable."""
+
+            response = client.models.generate_content(
+                model="gemini-3-pro-preview",
+                contents=prompt,
+                config={
+                    'temperature': 0.3,
+                    'thinking_config': {'thinking_budget': 4096}  # Capped at 4K per Gemini's recommendation
+                }
+            )
+
+        advice = response.text.strip() if response.text else "WAIT: No response from Gemini"
+        print(f"  [GEMINI RESCUE] Advice: {advice}")
+
+        return ActionResult(extracted_content=f"GEMINI ADVICE: {advice}")
+
+    except Exception as e:
+        return ActionResult(extracted_content=f"Gemini error: {str(e)[:100]}")
+
+
+# Email verification code reader
+GMAIL_EMAIL = os.getenv("GMAIL_EMAIL", "brandonlruiz98@gmail.com")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+
+@controller.action('Get email verification code from inbox (for account verification)')
+async def get_verification_code(sender_hint: str = "") -> ActionResult:
+    """Check Gmail inbox for recent verification codes"""
+    import imaplib
+    import email
+    from email.header import decode_header
+
+    if not GMAIL_APP_PASSWORD:
+        return ActionResult(extracted_content="No GMAIL_APP_PASSWORD configured")
+
+    try:
+        print(f"  [Email] Checking {GMAIL_EMAIL} for verification code...")
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        mail.login(GMAIL_EMAIL, GMAIL_APP_PASSWORD)
+        mail.select("INBOX")
+
+        _, messages = mail.search(None, "UNSEEN")
+        if not messages[0]:
+            _, messages = mail.search(None, "ALL")
+
+        email_ids = messages[0].split()[-10:] if messages[0] else []
+
+        for email_id in reversed(email_ids):
+            _, msg_data = mail.fetch(email_id, "(RFC822)")
+            for response_part in msg_data:
+                if isinstance(response_part, tuple):
+                    msg = email.message_from_bytes(response_part[1])
+                    subject, encoding = decode_header(msg["Subject"])[0]
+                    if isinstance(subject, bytes):
+                        subject = subject.decode(encoding or "utf-8", errors='ignore')
+
+                    sender = msg.get("From", "").lower()
+                    if sender_hint and sender_hint.lower() not in sender:
+                        continue
+
+                    body = ""
+                    if msg.is_multipart():
+                        for part in msg.walk():
+                            if part.get_content_type() == "text/plain":
+                                body = part.get_payload(decode=True).decode(errors='ignore')
+                                break
+                    else:
+                        body = msg.get_payload(decode=True).decode(errors='ignore')
+
+                    codes = re.findall(r'\b(\d{4,8})\b', body)
+                    if codes:
+                        code = codes[0]
+                        print(f"  [Email] Found code: {code} from {sender[:30]}")
+                        mail.logout()
+                        return ActionResult(extracted_content=f"Verification code: {code}")
+
+        mail.logout()
+        return ActionResult(extracted_content="No verification code found. Wait and try again.")
+
+    except Exception as e:
+        return ActionResult(extracted_content=f"Email error: {str(e)}")
+
 
 # ============ CONFIG ============
 QUEUE_DIR = Path("/root/job_bot/queue")
 OUTPUT_DIR = Path("/root/output")
 COOKIES_FILE = Path("/root/job_bot/agent/cookies.json")
-
-# Bright Data residential proxy settings from environment
-BRIGHT_DATA_PROXY = ProxySettings(
-    server="http://brd.superproxy.io:33335",
-    username=os.getenv("BRIGHT_DATA_USERNAME", ""),
-    password=os.getenv("BRIGHT_DATA_PASSWORD", ""),
-)
+STORAGE_STATE_FILE = Path("/root/job_bot/agent/storage_state.json")
 
 # Applicant info
 APPLICANT = {
     "name": "Brandon Ruiz",
-    "email": "brandonlruiz98@gmail.com",  # Must match Indeed account
+    "email": "brandonruizmarketing@gmail.com",
+    "email_external": "brandonlruiz98@gmail.com",
+    "password_external": "&p0wer2Jah!",
     "phone": "775-530-8234",
     "location": "Anaheim, CA",
+    "street_address": "1602 Juneau Ave",
+    "city": "Anaheim",
+    "state": "CA",
+    "zip_code": "92805",
+    "current_job_title": "IT Support Specialist",
+    "current_company": "Geek Squad",
+    "years_experience": "5",
+    "previous_job_title": "IT Support Specialist",
+    "previous_company": "Fusion Contact Centers",
 }
 
-# Rate limiting
-DELAY_BETWEEN_JOBS = 10  # seconds
+DELAY_BETWEEN_JOBS = 10
+N8N_WEBHOOK_URL = os.getenv('N8N_WEBHOOK_URL', 'http://localhost:5678/webhook/incoming-job')
 
 
-STORAGE_STATE_FILE = Path("/root/job_bot/agent/storage_state.json")
+def is_valid_job(job: dict) -> tuple[bool, str]:
+    """Check if job data is valid (not NaN, has required fields)"""
+    company = str(job.get('company', '')).strip().lower()
+    title = str(job.get('title', '')).strip().lower()
+    url = str(job.get('url', '')).strip()
+
+    # Check for NaN or empty values
+    if company in ['nan', 'none', ''] or not company:
+        return False, "invalid_company"
+    if title in ['nan', 'none', ''] or not title:
+        return False, "invalid_title"
+    if not url or 'indeed.com' not in url.lower():
+        return False, "invalid_url"
+
+    return True, "valid"
+
+
+def is_blocked_ats(url: str) -> tuple[bool, str]:
+    """Check if URL redirects to a blocked ATS domain"""
+    url_lower = url.lower()
+    for domain in BLOCKED_ATS_DOMAINS:
+        if domain in url_lower:
+            return True, domain
+    return False, ""
+
 
 def load_cookies_as_storage_state() -> str:
-    """Convert cookies.json to Playwright storage state file and return path"""
+    """Convert cookies.json to Playwright storage state file"""
     if not COOKIES_FILE.exists():
         return None
 
     raw_cookies = json.loads(COOKIES_FILE.read_text())
-
-    # Convert to Playwright cookie format
     pw_cookies = []
     for cookie in raw_cookies:
         pw_cookie = {
@@ -66,33 +829,22 @@ def load_cookies_as_storage_state() -> str:
             "secure": cookie.get("secure", False),
             "httpOnly": cookie.get("httpOnly", False),
         }
-
-        # Add expiration if not session cookie
         if cookie.get("expirationDate"):
             pw_cookie["expires"] = cookie.get("expirationDate")
-
-        # Handle sameSite
         same_site = cookie.get("sameSite", "Lax")
         if same_site == "no_restriction":
             same_site = "None"
         elif same_site == "unspecified":
             same_site = "Lax"
         pw_cookie["sameSite"] = same_site
-
         pw_cookies.append(pw_cookie)
 
-    storage_state = {
-        "cookies": pw_cookies,
-        "origins": []
-    }
-
-    # Write to file and return path
+    storage_state = {"cookies": pw_cookies, "origins": []}
     STORAGE_STATE_FILE.write_text(json.dumps(storage_state, indent=2))
     return str(STORAGE_STATE_FILE)
 
 
 def load_queue(name: str) -> list:
-    """Load a queue JSON file"""
     path = QUEUE_DIR / f"{name}.json"
     if path.exists():
         return json.loads(path.read_text())
@@ -100,19 +852,12 @@ def load_queue(name: str) -> list:
 
 
 def save_queue(name: str, data: list):
-    """Save a queue JSON file"""
     path = QUEUE_DIR / f"{name}.json"
     path.write_text(json.dumps(data, indent=2))
 
 
-N8N_WEBHOOK_URL = os.getenv('N8N_WEBHOOK_URL', 'http://localhost:5678/webhook/incoming-job')
-
-import requests as http_requests
-
-
 async def upload_file_to_cloud_session(session_id: str, file_path: str) -> str | None:
-    """Upload a local file to a Browser-Use Cloud session via presigned URL.
-    Returns the cloud filename on success, None on failure."""
+    """Upload a local file to Browser-Use Cloud session"""
     api_key = os.getenv("BROWSER_USE_API_KEY")
     file_path_obj = Path(file_path)
 
@@ -132,16 +877,10 @@ async def upload_file_to_cloud_session(session_id: str, file_path: str) -> str |
             size_bytes=file_size,
         )
 
-        # Upload the file to the presigned URL
         form_data = aiohttp.FormData()
         for key, value in presigned.fields.items():
             form_data.add_field(key, value)
-        form_data.add_field(
-            'file',
-            open(file_path, 'rb'),
-            filename=file_name,
-            content_type='application/pdf',
-        )
+        form_data.add_field('file', open(file_path, 'rb'), filename=file_name, content_type='application/pdf')
 
         async with aiohttp.ClientSession() as http_session:
             async with http_session.post(presigned.url, data=form_data) as resp:
@@ -158,8 +897,8 @@ async def upload_file_to_cloud_session(session_id: str, file_path: str) -> str |
         return None
 
 
-def send_to_factory(job: dict) -> dict | None:
-    """Send job to n8n resume factory and get back PDF paths"""
+async def send_to_factory_async(job: dict) -> dict | None:
+    """Send job to n8n resume factory (async version)"""
     payload = {
         'title': str(job.get('title', 'Unknown')),
         'company': str(job.get('company', 'Unknown')),
@@ -170,21 +909,23 @@ def send_to_factory(job: dict) -> dict | None:
 
     try:
         print(f"  Sending to n8n factory for resume generation...")
-        response = http_requests.post(
-            N8N_WEBHOOK_URL,
-            json=payload,
-            headers={'Content-Type': 'application/json'},
-            timeout=180,
-        )
-
-        if response.status_code in [200, 202]:
-            result = response.json()
-            print(f"  Factory success: app #{result.get('application_number')}")
-            return result
-        else:
-            print(f"  Factory error: HTTP {response.status_code}")
-            return None
-
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                N8N_WEBHOOK_URL,
+                json=payload,
+                headers={'Content-Type': 'application/json'},
+                timeout=aiohttp.ClientTimeout(total=180)
+            ) as response:
+                if response.status in [200, 202]:
+                    result = await response.json()
+                    print(f"  Factory success: app #{result.get('application_number')}")
+                    return result
+                else:
+                    print(f"  Factory error: HTTP {response.status}")
+                    return None
+    except asyncio.TimeoutError:
+        print(f"  Factory timeout (180s)")
+        return None
     except Exception as e:
         print(f"  Factory connection failed: {e}")
         return None
@@ -192,10 +933,9 @@ def send_to_factory(job: dict) -> dict | None:
 
 def get_resume_path(job: dict) -> str | None:
     """Find resume PDF for this job"""
-    company = job.get('company', '').replace(' ', '_').replace('/', '_')[:30]
+    company = str(job.get('company', '')).replace(' ', '_').replace('/', '_')[:30]
     app_num = job.get('application_number', '')
 
-    # Try patterns (company/app-specific only — no catch-all)
     patterns = [
         f"{company}_{app_num}_Resume.pdf",
         f"{company}_*_Resume.pdf",
@@ -205,15 +945,21 @@ def get_resume_path(job: dict) -> str | None:
     for pattern in patterns:
         matches = list(OUTPUT_DIR.glob(pattern))
         if matches:
-            # Return most recent
             return str(sorted(matches, key=lambda x: x.stat().st_mtime, reverse=True)[0])
-
     return None
 
 
 def is_indeed_url(url: str) -> bool:
-    """Check if URL is from Indeed"""
     return "indeed.com" in url.lower()
+
+
+def check_success(content: str) -> bool:
+    """Check if content indicates successful application (flexible matching)"""
+    content_lower = content.lower()
+    for keyword in SUCCESS_KEYWORDS:
+        if keyword in content_lower:
+            return True
+    return False
 
 
 def build_task(job: dict, resume_path: str | None) -> str:
@@ -231,39 +977,170 @@ You MUST upload this specific custom resume file: {resume_path}
 - Make sure the uploaded filename shows the custom file, NOT a default Indeed resume
 """
 
-    task = f"""
-Go to this job posting and apply using Easy Apply: {job.get('url')}
+    job_url = job.get('url', '')
+    is_external = 'indeed.com' not in job_url.lower()
+    email_to_use = APPLICANT.get('email_external', APPLICANT['email']) if is_external else APPLICANT['email']
+
+    # Common success criteria (FLEXIBLE)
+    success_criteria = """
+SUCCESS CRITERIA (FLEXIBLE - IMPORTANT):
+You are done when you see ANY of these confirmations:
+- "Application submitted" or "Application has been submitted"
+- "Application sent" or "Application has been sent"
+- "Thank you for applying" or "Thanks for applying"
+- "Successfully applied" or "Application complete"
+- "We received your application" or "Application received"
+- Any green checkmark with a thank you message
+- Any confirmation page after clicking final Submit/Apply
+
+Do NOT require exact text matching. If the page clearly shows the application went through, report SUCCESS.
+"""
+
+    if is_external:
+        task = f"""
+Go to this job posting and complete the application: {job_url}
+
+{success_criteria}
+
+APPLICANT INFO - Use these details for ALL form fields:
+- Full Name: {APPLICANT['name']}
+- Email: {email_to_use}
+- Password: {APPLICANT.get('password_external', '')}
+- Phone: {APPLICANT['phone']}
+- City/Location: {APPLICANT['location']}
+- Street Address: {APPLICANT.get('street_address', '1602 Juneau Ave')}
+- City: {APPLICANT.get('city', 'Anaheim')}
+- State: {APPLICANT.get('state', 'CA')}
+- Zip Code: {APPLICANT.get('zip_code', '92805')}
+
+WORK HISTORY - Use for experience questions:
+- Current Job Title: {APPLICANT.get('current_job_title', 'IT Support Technician')}
+- Current Company: {APPLICANT.get('current_company', 'Geek Squad')}
+- Years of Experience: {APPLICANT.get('years_experience', '5')}
+- Previous Job Title: {APPLICANT.get('previous_job_title', 'IT Support Specialist')}
+- Previous Company: {APPLICANT.get('previous_company', 'Fusion Contact Centers')}
+
+IMPORTANT RULES:
+- If asked to create an account or sign in, use the email and password above
+- If a dialog box or popup appears, close it immediately
+- Complete ALL pages of the application form
+- Answer Yes/No qualification questions with "Yes" unless clearly unqualified
+- For work authorization: "Yes, authorized to work in the US"
+- For sponsorship: "No, do not require sponsorship"
+
+CAPTCHA HANDLING:
+- If you encounter ANY CAPTCHA (reCAPTCHA, hCaptcha, Cloudflare), use the solve_captcha action
+- After calling solve_captcha, wait then click Submit/Continue
+- Do NOT give up on CAPTCHAs - always try solve_captcha first
+
+RESCUE MODE (IMPORTANT - USE WHEN STUCK):
+- If you are stuck, confused, or have tried the same action 2+ times without progress, use ask_gemini_for_help
+- Call it with a description of your problem, e.g., ask_gemini_for_help("Form keeps showing error")
+- Gemini will analyze the page and give you ONE specific action to take
+- Follow Gemini's advice exactly
+
+EMAIL VERIFICATION:
+- If asked for a verification code, use the get_verification_code action
+- Enter the code and continue
+
+{resume_instruction}
+
+STEPS:
+1. Go to the job URL and click Apply/Apply Now
+2. If given option, choose "Apply as Guest" or "Continue without account"
+3. Fill in all required fields using the applicant info above
+4. Upload the resume when prompted
+5. Complete all pages, clicking Continue/Next after each
+6. On voluntary self-identification pages, select "I do not want to answer"
+7. Review and submit the application
+8. Report SUCCESS if you see any confirmation
+
+When done, say "SUCCESS" if you see any confirmation that the application was submitted/sent/received.
+If the job is unavailable or expired, say "JOB_UNAVAILABLE".
+Otherwise explain what went wrong.
+"""
+    else:
+        task = f"""
+Go to this job posting and apply using Easy Apply: {job_url}
+
+{success_criteria}
+
+CRITICAL URL CHECK (IMPORTANT - READ THIS):
+- After clicking Apply, call verify_indeed_easy_apply to check you're still on Indeed
+- If it says "ABORT" or "EXTERNAL_SITE", IMMEDIATELY stop and say "EXTERNAL_SITE"
+- Do NOT continue if the URL leaves indeed.com - external ATS sites require different handling
 
 IMPORTANT RULES:
 - ONLY proceed if you see "Easy Apply" or a simple "Apply" button on Indeed
-- If you're asked to login, sign in, or create an account - STOP and say "NEEDS_LOGIN"
-- If you're redirected to an external site (not indeed.com) - STOP and say "EXTERNAL_SITE"
-- If a dialog box or popup appears that blocks the form, close it immediately before continuing
-- Complete ALL pages of the application form until you see a confirmation
-- On each page, make sure ALL required fields/questions are answered BEFORE clicking Continue
-- Answer all Yes/No qualification questions with "Yes" one by one
+- If button says "Apply on company site" - STOP and say "EXTERNAL_SITE"
+- If you're on Indeed and asked to login - STOP and say "NEEDS_LOGIN"
+- If a dialog box or popup appears, close it immediately
+- Complete ALL pages of the application form
+- Answer all Yes/No qualification questions with "Yes"
+
+HUMAN-LIKE PACING (IMPORTANT - AVOID BOT DETECTION):
+- Wait 1-2 seconds after page loads before clicking
+- After clicking radio buttons or checkboxes, call humanize_form_field to ensure React registers the change
+- Don't rush - a real human would read the page before clicking
+- If you see "Something went wrong" repeatedly, try waiting longer between actions
+
+VALIDATION CHECK (BEFORE CLICKING CONTINUE/SUBMIT):
+- Call check_validation_errors before clicking Continue or Submit
+- If it finds errors (red text, empty required fields), FIX THEM first
+- Do NOT click Continue/Submit multiple times without fixing errors
+- If you see "Something went wrong" - scroll up and look for red error messages
+
+CAPTCHA HANDLING:
+- If you see "Additional Verification Required" or any CAPTCHA, use the solve_captcha action
+- The solve_captcha action supports Cloudflare Turnstile, reCAPTCHA, AND hCaptcha
+- After calling solve_captcha, wait then refresh or click verify/continue
+- Do NOT give up on CAPTCHAs - always try solve_captcha first
+
+RESCUE MODE (IMPORTANT - USE WHEN STUCK):
+- If you are stuck, confused, or have tried the same action 2+ times without progress, use ask_gemini_for_help
+- Call it with a description of your problem, e.g., ask_gemini_for_help("Cannot find the Submit button")
+- Gemini will analyze the page and give you ONE specific action to take
+- Follow Gemini's advice exactly
+
+APPLICANT INFO (for Indeed):
+- Full Name: {APPLICANT['name']}
+- Email: {APPLICANT['email']}
+- Phone: {APPLICANT['phone']}
+- City/Location: {APPLICANT['location']}
+- Street Address: {APPLICANT.get('street_address', '')}
+- City: {APPLICANT.get('city', 'Anaheim')}
+- State: {APPLICANT.get('state', 'CA')}
+- Zip Code: {APPLICANT.get('zip_code', '92805')}
+
+WORK HISTORY (for "relevant experience" questions):
+- Job Title: IT Support Specialist
+- Company: Geek Squad
+- Years of Experience: 5
+
+{resume_instruction}
 
 STEPS:
 1. Go to the job URL
 2. Find and click "Easy Apply" or "Apply now" button
-3. Fill in these fields if they appear:
-   - Full Name: {APPLICANT['name']}
-   - Email: {APPLICANT['email']}
-   - Phone: {APPLICANT['phone']}
-   - City/Location: {APPLICANT['location']}
-{resume_instruction}
-4. Click Continue on each page after verifying all fields are filled
-5. On voluntary self-identification pages, select "I do not want to answer" for each question
-6. Click Submit/Apply/Review until application is fully submitted
-7. Wait for and screenshot the confirmation page
+3. Call verify_indeed_easy_apply - if it says ABORT, stop and say "EXTERNAL_SITE"
+4. Fill in the applicant info fields if they appear
+5. Call check_validation_errors before clicking Continue
+6. Click Continue on each page (only after validation passes)
+7. On voluntary self-identification pages, select "I do not want to answer"
+8. Click Submit/Apply until done
+9. Report SUCCESS when you see confirmation
 
-When done, say "SUCCESS" if application submitted, or explain why it failed.
+When done, say "SUCCESS" if you see any confirmation (submitted, sent, received, thank you).
+If the job redirects to external site, say "EXTERNAL_SITE".
+If the job is unavailable or expired, say "JOB_UNAVAILABLE".
+If Indeed requires login, say "NEEDS_LOGIN".
+Otherwise explain what went wrong.
 """
     return task
 
 
 async def apply_to_job(job: dict) -> tuple[bool, str]:
-    """Apply to a single job using Browser-Use Cloud with US residential proxy"""
+    """Apply to a single job using Browser-Use Cloud"""
 
     job_url = job.get('url', '')
     job_title = job.get('title', 'Unknown')
@@ -272,18 +1149,15 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
     print(f"\n{'='*60}")
     print(f"Job: {job_title} at {job_company}")
     print(f"URL: {job_url}")
+    is_external = not is_indeed_url(job_url)
+    print(f"Type: {'External ATS' if is_external else 'Indeed Easy Apply'}")
     print(f"{'='*60}")
 
-    # Check if Indeed URL
-    if not is_indeed_url(job_url):
-        print("SKIP: Not an Indeed URL")
-        return False, "not_indeed_url"
-
-    # Send through n8n factory if no resume exists yet
+    # Get or generate resume
     resume_path = get_resume_path(job)
     if not resume_path:
         print("No resume found — sending to n8n factory...")
-        factory_result = send_to_factory(job)
+        factory_result = await send_to_factory_async(job)
         if factory_result and factory_result.get('files', {}).get('resume'):
             resume_filename = factory_result['files']['resume']
             resume_path = str(OUTPUT_DIR / resume_filename)
@@ -291,23 +1165,19 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
         else:
             print("WARNING: Factory failed to generate resume, continuing without one")
 
-    # Get resume path
     if resume_path:
         print(f"Resume: {resume_path}")
     else:
         print("Resume: None found")
 
-    # Build task
-    task = build_task(job, resume_path)
-
-    # Load Indeed cookies as storage state file
+    # Load cookies
     storage_state_path = load_cookies_as_storage_state()
     if storage_state_path:
         print(f"Loaded cookies from {storage_state_path}")
     else:
         print("WARNING: No cookies found - may need to login")
 
-    # Create cloud browser session with US residential proxy
+    # Create cloud browser session
     browser_use_api_key = os.getenv("BROWSER_USE_API_KEY")
     os.environ["BROWSER_USE_API_KEY"] = browser_use_api_key
 
@@ -317,13 +1187,26 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
         storage_state=storage_state_path,
     )
 
-    # Pre-start the browser so we can upload files to the cloud session
-    await browser.start()
+    # Rate limit retry logic (Gemini Priority 1.3 recommendation)
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            await browser.start()
+            break  # Success
+        except Exception as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "too many" in error_str or "rate limit" in error_str:
+                wait_time = 30 * (attempt + 1)  # Exponential: 30s, 60s, 90s
+                print(f"  [RATE LIMIT] Browser-Use 429 error. Waiting {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(wait_time)
+                if attempt == max_retries - 1:
+                    return False, "rate_limit_exceeded"
+            else:
+                raise  # Re-raise non-rate-limit errors
 
-    # Upload resume to cloud browser session if we have one
+    # Upload resume to cloud
     cloud_resume_name = None
     if resume_path:
-        # Extract session ID from the CDP URL (format: wss://SESSION_ID.cdpN.browser-use.com)
         cdp_url = browser.browser_profile.cdp_url or ""
         session_match = re.search(r'wss://([^.]+)\.cdp', cdp_url)
         if session_match:
@@ -331,54 +1214,87 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
             print(f"Cloud session: {cloud_session_id}")
             cloud_resume_name = await upload_file_to_cloud_session(cloud_session_id, resume_path)
 
-    # Set available file paths for the agent
     file_paths = []
     if cloud_resume_name:
         file_paths.append(cloud_resume_name)
     elif resume_path:
         file_paths.append(resume_path)
 
-    # Create agent — use Browser-Use's native model for AI decisions
+    agent_resume_path = cloud_resume_name if cloud_resume_name else resume_path
+    if cloud_resume_name:
+        print(f"Using cloud resume path for agent: {cloud_resume_name}")
+    task = build_task(job, agent_resume_path)
+
+    # Create screenshots directory
+    screenshots_dir = Path("/root/job_bot/screenshots")
+    screenshots_dir.mkdir(exist_ok=True)
+    job_id = job.get('id', job.get('application_number', 'unknown'))
+    gif_path = str(screenshots_dir / f"{job_company.replace(' ', '_')[:20]}_{job_id}.gif")
+
     agent = Agent(
         task=task,
         browser_session=browser,
+        controller=controller,
         use_vision=True,
         available_file_paths=file_paths,
-        max_failures=10,        # Tolerate transient LLM API errors
-        max_actions_per_step=5, # Allow more actions per step for complex forms
+        max_failures=10,
+        max_actions_per_step=5,
+        max_steps=50,
+        generate_gif=gif_path,
     )
+    print(f"Recording session to: {gif_path}")
 
     try:
         print("Starting Browser-Use Cloud agent...")
         result = await agent.run()
 
-        # Parse result - use regex on string representation (most reliable)
         result_str = str(result)
         final_content = ""
 
-        # Look for the done action's extracted_content
-        done_pattern = r"is_done=True.*?extracted_content='([^']+)'"
+        # Improved regex - handles quotes and longer content
+        done_pattern = r"is_done=True.*?extracted_content=['\"](.+?)['\"]"
         matches = re.findall(done_pattern, result_str, re.DOTALL)
         if matches:
             final_content = matches[-1]
         else:
-            # Fallback: any extracted_content that looks like a status
-            status_match = re.search(r"extracted_content='(NEEDS_LOGIN|EXTERNAL_SITE|COMPLEX_FORM|SUCCESS)'", result_str)
+            # Fallback: look for any extracted_content
+            status_match = re.search(r"extracted_content=['\"]([^'\"]+)['\"]", result_str)
             if status_match:
                 final_content = status_match.group(1)
 
         print(f"Result: {final_content or 'No clear status found'}")
 
-        # Check result based on extracted content
+        # Also check the full result string for success indicators (Gemini's fix)
+        result_str_lower = result_str.lower()
+
+        # FAST-FAIL: Check for job unavailable in full result
+        for keyword in JOB_UNAVAILABLE_KEYWORDS:
+            if keyword in result_str_lower:
+                print(f"  [FAST-FAIL] Job unavailable detected: '{keyword}'")
+                return False, "job_unavailable"
+
+        # Check for success in the full result string (catches more cases)
+        for keyword in SUCCESS_KEYWORDS:
+            if keyword in result_str_lower:
+                print(f"  [SUCCESS] Found in full result: '{keyword}'")
+                return True, "applied"
+
         final_upper = final_content.upper()
 
         if "NEEDS_LOGIN" in final_upper:
             return False, "needs_login"
-        elif "EXTERNAL_SITE" in final_upper:
-            return False, "external_site"
-        elif "SUCCESS" in final_upper or "SUBMITTED" in final_upper or "APPLIED" in final_upper:
+        elif "JOB_UNAVAILABLE" in final_upper or "NO LONGER EXISTS" in final_upper or "JOB POST NO LONGER" in final_upper:
+            return False, "job_unavailable"
+        elif "EXTERNAL_SITE" in final_upper or "EXTERNAL ATS" in final_upper or "COMPANY SITE" in final_upper:
+            return False, "external_site"  # Special status for separate queue
+
+        # FLEXIBLE SUCCESS MATCHING
+        if check_success(final_content):
             return True, "applied"
-        elif final_content:
+        if "SUCCESS" in final_upper:
+            return True, "applied"
+
+        if final_content:
             return False, final_content[:200]
         else:
             return False, "incomplete"
@@ -388,29 +1304,32 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
         return False, str(e)[:200]
 
     finally:
-        # Clean up browser session
         try:
             await browser.close()
         except:
             pass
 
 
-async def main(max_jobs: int = 1, dry_run: bool = False):
+async def main(max_jobs: int = 1, dry_run: bool = False, skip_blocked: bool = True):
     """Main entry point"""
 
     print("\n" + "="*60)
     print("Indeed Easy Apply Bot - Cloud + US Residential Proxy")
+    print("IMPROVED: hCaptcha support, flexible success detection, ATS filtering")
     print("="*60)
 
-    # Load queues
     pending = load_queue("pending")
     applied = load_queue("applied")
     failed = load_queue("failed")
+    skipped = load_queue("skipped")
+    external = load_queue("external")  # Separate queue for external ATS jobs
 
     print(f"\nQueue status:")
     print(f"  Pending: {len(pending)}")
     print(f"  Applied: {len(applied)}")
     print(f"  Failed: {len(failed)}")
+    print(f"  Skipped: {len(skipped)}")
+    print(f"  External: {len(external)}")  # Jobs that redirect to external ATS
 
     if not pending:
         print("\nNo jobs in pending queue!")
@@ -419,50 +1338,77 @@ async def main(max_jobs: int = 1, dry_run: bool = False):
     if dry_run:
         print("\n[DRY RUN MODE - No actual applications]")
         for job in pending[:max_jobs]:
-            print(f"\nWould apply to: {job.get('title')} at {job.get('company')}")
+            valid, reason = is_valid_job(job)
+            blocked, domain = is_blocked_ats(job.get('url', ''))
+            print(f"\n{job.get('title')} at {job.get('company')}")
             print(f"  URL: {job.get('url')}")
-            print(f"  Is Indeed: {is_indeed_url(job.get('url', ''))}")
-            resume = get_resume_path(job)
-            print(f"  Resume: {resume or 'None found'}")
+            print(f"  Valid: {valid} ({reason})")
+            print(f"  Blocked ATS: {blocked} ({domain})")
+            print(f"  Resume: {get_resume_path(job) or 'None found'}")
         return
 
-    # Process jobs
     jobs_processed = 0
+    jobs_skipped = 0
 
     while pending and jobs_processed < max_jobs:
         job = pending.pop(0)
 
-        success, reason = await apply_to_job(job)
+        # ============ VALIDATION CHECKS ============
+        valid, reason = is_valid_job(job)
+        if not valid:
+            print(f"\n[SKIP] Invalid job data: {reason} - {job.get('title', 'Unknown')}")
+            job['skip_reason'] = reason
+            skipped.append(job)
+            save_queue("pending", pending)
+            save_queue("skipped", skipped)
+            jobs_skipped += 1
+            continue
 
-        # Record result
-        job['apply_result'] = reason
+        if skip_blocked:
+            blocked, domain = is_blocked_ats(job.get('url', ''))
+            if blocked:
+                print(f"\n[SKIP] Blocked ATS ({domain}): {job.get('title', 'Unknown')}")
+                job['skip_reason'] = f"blocked_ats:{domain}"
+                skipped.append(job)
+                save_queue("pending", pending)
+                save_queue("skipped", skipped)
+                jobs_skipped += 1
+                continue
+
+        # ============ APPLY ============
+        success, result_reason = await apply_to_job(job)
+
+        job['apply_result'] = result_reason
         job['apply_timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
 
         if success:
             print(f"\n[SUCCESS] Applied to {job.get('company')}")
             applied.append(job)
+        elif result_reason == "external_site":
+            print(f"\n[EXTERNAL] {job.get('company')}: Redirects to external ATS (saved for later)")
+            external.append(job)
         else:
-            print(f"\n[FAILED] {job.get('company')}: {reason}")
+            print(f"\n[FAILED] {job.get('company')}: {result_reason}")
             failed.append(job)
 
-        # Save queues after each job
         save_queue("pending", pending)
         save_queue("applied", applied)
         save_queue("failed", failed)
+        save_queue("external", external)
 
         jobs_processed += 1
 
-        # Rate limiting
         if pending and jobs_processed < max_jobs:
             print(f"\nWaiting {DELAY_BETWEEN_JOBS}s before next job...")
             await asyncio.sleep(DELAY_BETWEEN_JOBS)
 
-    # Final summary
     print("\n" + "="*60)
     print("Session Complete")
     print("="*60)
     print(f"Processed: {jobs_processed}")
+    print(f"Skipped: {jobs_skipped}")
     print(f"Applied: {len(applied)}")
+    print(f"External: {len(external)} (saved for later - need different approach)")
     print(f"Failed: {len(failed)}")
     print(f"Remaining: {len(pending)}")
 
@@ -473,6 +1419,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Indeed Easy Apply Bot")
     parser.add_argument("--max", type=int, default=1, help="Max jobs to process")
     parser.add_argument("--dry-run", action="store_true", help="Preview without applying")
+    parser.add_argument("--no-skip", action="store_true", help="Don't skip blocked ATS domains")
     args = parser.parse_args()
 
-    asyncio.run(main(max_jobs=args.max, dry_run=args.dry_run))
+    asyncio.run(main(max_jobs=args.max, dry_run=args.dry_run, skip_blocked=not args.no_skip))
