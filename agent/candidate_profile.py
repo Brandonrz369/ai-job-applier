@@ -69,7 +69,7 @@ new setup, we've already noticed a significant improvement in call quality."
 responsive and..."
 
 -----------------------------------------------------------------------------
-MARINA SHIPYARD (Primary MSP Client) | Jul 2024 - Present
+MARINA SHIPYARD (Primary MSP Client) | Apr 2025 - Present
 -----------------------------------------------------------------------------
 
 Contract Value:
@@ -116,7 +116,7 @@ Technical Environment Managed:
 - Users: 7 total
 
 -----------------------------------------------------------------------------
-FUSION CONTACT CENTERS (IT Support -> Escalation Team) | Aug 2016 - Aug 2017
+FUSION CONTACT CENTERS (IT Support -> Escalation Team) | Aug 2016 - Aug 2017 | Reno, NV
 -----------------------------------------------------------------------------
 
 * PROMOTED TO ESCALATION TEAM AT AGE 18
