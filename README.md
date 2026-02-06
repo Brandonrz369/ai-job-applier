@@ -38,7 +38,7 @@ An AI-powered system that automatically finds, evaluates, and applies to jobs at
 |                                                                          |
 |  +-----------+    +-------------+    +-------------+    +-------------+ |
 |  |  SCRAPER  |--->|   SCORER    |--->|  GENERATOR  |--->|   APPLIER   | |
-|  |  JobSpy   |    | Gemini 2.5  |    | Gemini 2.0  |    | Browser-Use | |
+|  |  JobSpy   |    | Gemini 2.5  |    | Gemini 3    |    | Browser-Use | |
 |  |           |    |   Flash     |    |   Flash     |    |    Cloud    | |
 |  +-----------+    +-------------+    +-------------+    +-------------+ |
 |       |                 |                  |                  |          |
@@ -76,7 +76,7 @@ An AI-powered system that automatically finds, evaluates, and applies to jobs at
 - **Salary Floor**: $60K minimum (auto-reject below)
 
 ### 3. PDF Generator (n8n workflow)
-- **Model**: Gemini 2.0 Flash (via n8n HTTP nodes)
+- **Model**: Gemini 3 Pro (via n8n HTTP nodes)
 - **Generates**: Tailored resume + cover letter HTML
 - **Converter**: Gotenberg (HTML -> PDF, containerized)
 - **Naming**: `Company_AppNumber_Resume.pdf`
@@ -243,7 +243,7 @@ python3 -m json.tool /root/job_bot/queue/applied.json
 |-------|------------|
 | Scraping | JobSpy (Python, parallel threads) |
 | Job Scoring | Gemini 2.5 Flash (Google AI) |
-| Document Generation | Gemini 2.0 Flash (via n8n) |
+| Document Generation | Gemini 3 Pro (via n8n) |
 | PDF Conversion | Gotenberg (containerized) |
 | Browser Automation | Browser-Use Cloud (US residential proxy) |
 | Rescue AI | Gemini 2.5 Flash (Tier 1) + Gemini 3 Pro (Tier 2) |

@@ -14,7 +14,7 @@ JobSpy Scraper (agent/simple_hunter.py)
     ↓ Raw listings
 Gemini 2.5 Flash Scorer (agent/scorer.py)
     ↓ Score >= 6 only
-n8n Webhook → Gemini 2.0 Flash (resume/cover HTML) → Gotenberg (PDF)
+n8n Webhook → Gemini 3 Pro (resume/cover HTML) → Gotenberg (PDF)
     ↓ Tailored PDFs
 Queue System (queue/pending.json)
     ↓
@@ -51,7 +51,7 @@ Indeed Easy Apply + External ATS (with guest apply)
 | Purpose | Model | Provider |
 |---------|-------|----------|
 | Job Scoring | Gemini 2.5 Flash | Google AI |
-| Resume/Cover Letter Gen | Gemini 2.0 Flash | Google AI (via n8n) |
+| Resume/Cover Letter Gen | Gemini 3 Pro | Google AI (via n8n) |
 | Browser Agent (primary) | Browser-Use Cloud | Browser-Use |
 | Rescue Tier 1 (fast) | Gemini 2.5 Flash | Google AI |
 | Rescue Tier 2 (deep) | Gemini 3 Pro Preview (4K thinking) | Google AI |
