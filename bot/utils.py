@@ -136,7 +136,7 @@ async def check_cookie_health(page) -> bool:
         logger.info(f"Checking session health at {target_url}...")
 
         # Navigate with a 30-second timeout
-        response = await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+        response = await page.goto(target_url, timeout=30000)
 
         if not response:
             logger.error("Failed to get a response from Indeed.")

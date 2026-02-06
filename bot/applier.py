@@ -26,6 +26,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import os
 import aiohttp
+import requests
 
 # Import new utilities
 from utils import (
@@ -200,11 +201,12 @@ class SessionLogger:
         timestamp = self.start_time.strftime('%Y%m%d_%H%M%S')
         self.log_file = LOG_DIR / f"{company}_{self.job_id}_{timestamp}.json"
 
-    def log_step(self, step_num: int, action: str, details: str, url: str = "", error: str = ""):
+    def log_step(self, step_num: int, action: str, details: str, url: str = "", error: str = "", ts: str = ""):
+        now = datetime.now()
         entry = {
             'step': step_num,
-            'ts': datetime.now().isoformat(),
-            'elapsed_s': round((datetime.now() - self.start_time).total_seconds(), 1),
+            'ts': ts or now.isoformat(),
+            'elapsed_s': round((now - self.start_time).total_seconds(), 1),
             'action': action,
             'details': (details or '')[:500],
             'url': url,
@@ -250,7 +252,7 @@ class SessionLogger:
                 'total_steps': total_steps or len(self.steps),
                 'result': result,
                 'success': success,
-                'version': 'v4',
+                'version': 'v5',
             },
             'captcha': self.captcha_events,
             'form_injection': self.form_events,
@@ -344,13 +346,15 @@ Use CSS selectors like [name="fieldname"] or #id"""
             return ActionResult(extracted_content="Could not generate field mapping. Use manual form filling.")
 
         # Inject the form filler function and execute it
-        injection_script = f"""
-        {FORM_FILLER_JS}
+        # Browser-Use evaluate() requires arrow function format: (...args) => { ... }
+        # Pass field_mapping as argument to avoid JS string escaping issues
+        injection_script = (
+            "async (fieldMapping) => {\n"
+            + FORM_FILLER_JS
+            + "\n; return await injectFormData(fieldMapping);\n}"
+        )
 
-        return await injectFormData({json.dumps(field_mapping)});
-        """
-
-        result = await page.evaluate(injection_script)
+        result = await page.evaluate(injection_script, field_mapping)
 
         filled = result.get('filled', [])
         failed = result.get('failed', [])
@@ -490,13 +494,20 @@ async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
             # ============ 2. Create Task (async) ============
             print(f"  [CapSolver] Creating task: {captcha_type} with key {site_key[:20]}...")
 
+            # Pass browser userAgent to CapSolver for better solve reliability
+            browser_ua = await page.evaluate("() => navigator.userAgent")
+
+            task_payload = {
+                "type": captcha_type,
+                "websiteURL": page_url,
+                "websiteKey": site_key,
+            }
+            if browser_ua:
+                task_payload["userAgent"] = browser_ua
+
             payload = {
                 "clientKey": CAPSOLVER_API_KEY,
-                "task": {
-                    "type": captcha_type,
-                    "websiteURL": page_url,
-                    "websiteKey": site_key
-                }
+                "task": task_payload,
             }
 
             async with http_client.post("https://api.capsolver.com/createTask", json=payload, timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -669,6 +680,44 @@ async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
         return ActionResult(extracted_content=f"CAPTCHA solving error: {str(e)}")
 
 
+# ============ PRE-DETECT EXTERNAL JOBS (avoid wasting browser sessions) ============
+def pre_detect_easy_apply(job_url: str, timeout: int = 10) -> str | None:
+    """Lightweight HTTP check to detect if a job is Easy Apply or external.
+    Returns: 'easy_apply', 'external', or None (uncertain - launch browser to check).
+    Conservative: only returns 'external' on strong signals, defaults to None.
+    """
+    if 'indeed.com' not in job_url:
+        return 'external'
+    try:
+        resp = requests.get(
+            job_url,
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'},
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        # Non-200 or CAPTCHA page = uncertain, let browser handle it
+        if resp.status_code != 200:
+            return None
+        text = resp.text
+        text_lower = text.lower()
+        # CAPTCHA / bot detection page = uncertain
+        if 'verify you are human' in text_lower or 'captcha' in text_lower:
+            return None
+        # Check if redirected away from Indeed
+        if 'indeed.com' not in resp.url:
+            return 'external'
+        # Strong external indicator: button specifically labeled for company site
+        # Use exact HTML patterns to avoid false positives from footer/sidebar text
+        if 'apply on company site' in text_lower and 'indeedapplybutton' not in text_lower:
+            return 'external'
+        # Strong Easy Apply indicator: the indeedApply widget ID exists in HTML
+        if 'indeedapplybutton' in text_lower or 'indeed-apply-widget' in text_lower:
+            return 'easy_apply'
+    except Exception:
+        pass
+    return None  # Uncertain - let the browser handle it
+
+
 # ============ URL GUARD - Stop if leaving Indeed ============
 ALLOWED_DOMAINS = ['indeed.com', 'indeed.co', 'indeed.ca', 'indeed.co.uk']
 EXTERNAL_ATS_INDICATORS = ['greenhouse.io', 'lever.co', 'workday', 'icims.com', 'taleo', 'brassring', 'ultipro', 'successfactors', 'oraclecloud']
@@ -756,7 +805,7 @@ async def verify_indeed_easy_apply(browser_session: BrowserSession) -> ActionRes
         return ActionResult(extracted_content=f"URL check error: {str(e)}")
 
 
-# ============ SPA WATCHDOG (v4 - 5/5 consensus) ============
+# ============ SPA WATCHDOG ============
 @controller.action('Check if page loaded - use when page seems blank, stuck, or shows "Preparing review"')
 async def check_and_reload_page(browser_session: BrowserSession) -> ActionResult:
     """SPA Watchdog: Detects empty/stuck pages and reloads. Use when:
@@ -808,7 +857,7 @@ async def check_and_reload_page(browser_session: BrowserSession) -> ActionResult
             print(f"  [SPA Watchdog] Page appears empty ({el_count} elements, {body_len} chars). Reloading...")
             if _active_logger:
                 _active_logger.log_step(0, 'spa_reload', f"Empty page: {el_count} elements", check.get('url', ''))
-            await page.reload(wait_until='networkidle', timeout=15000)
+            await page.reload(timeout=15000)
             await asyncio.sleep(3)
 
             recheck = await page.evaluate("""() => {
@@ -834,6 +883,60 @@ async def check_and_reload_page(browser_session: BrowserSession) -> ActionResult
 
     except Exception as e:
         return ActionResult(extracted_content=f"Page check error: {str(e)}. Try scrolling or waiting.")
+
+
+@controller.action('Click the Submit/Continue button in the page footer via JavaScript - use instead of scrolling')
+async def click_footer_button(browser_session: BrowserSession) -> ActionResult:
+    """Directly clicks the Submit/Continue/Apply button in the Indeed Easy Apply footer.
+    Use this when you're on the review page instead of scrolling to find the button."""
+    try:
+        page = await browser_session.get_current_page()
+        if not page:
+            return ActionResult(extracted_content="Could not get current page")
+
+        result = await page.evaluate("""() => {
+            // Try multiple selectors for the footer submit/continue button
+            const selectors = [
+                'button[name="submit-application"]',
+                '.ia-BasePage-footer button[type="submit"]',
+                '.ia-BasePage-footer button.ia-continueButton',
+                'button[id*="submit"]',
+                '.ia-BasePage-footer button',
+                'button.ia-ContinueButton',
+            ];
+            for (const sel of selectors) {
+                const btn = document.querySelector(sel);
+                if (btn && !btn.disabled) {
+                    btn.scrollIntoView({ block: 'center' });
+                    btn.click();
+                    return { clicked: true, selector: sel, text: btn.textContent.trim() };
+                }
+            }
+            // Try any visible submit-like button as fallback
+            const allBtns = document.querySelectorAll('button');
+            for (const btn of allBtns) {
+                const text = (btn.textContent || '').toLowerCase().trim();
+                if ((text.includes('submit') || text.includes('continue') || text.includes('apply'))
+                    && !btn.disabled && btn.offsetParent !== null) {
+                    btn.scrollIntoView({ block: 'center' });
+                    btn.click();
+                    return { clicked: true, selector: 'fallback', text: btn.textContent.trim() };
+                }
+            }
+            return { clicked: false };
+        }""")
+
+        if result and result.get('clicked'):
+            return ActionResult(
+                extracted_content=f"Clicked footer button: '{result.get('text', 'unknown')}' via {result.get('selector')}. "
+                "Wait for page transition."
+            )
+        return ActionResult(
+            extracted_content="No submit/continue button found in footer. Button may be disabled (check CAPTCHA) or page hasn't loaded."
+        )
+
+    except Exception as e:
+        return ActionResult(extracted_content=f"Footer click error: {str(e)}")
 
 
 @controller.action('Check for form validation errors before clicking Continue/Submit')
@@ -1466,7 +1569,7 @@ Go to this job posting and apply using Easy Apply: {job_url}
 
 === RULES ===
 
-1. FORM FILLING: Call `inject_form_data` FIRST when you see form inputs. If it fails, type manually.
+1. FORM FILLING: Call `inject_form_data` FIRST when you see form inputs. It fills ALL fields at once. If it fails, type manually.
 
 2. RESUME: Upload the custom resume. See RESUME UPLOAD section. Verify filename matches.
 
@@ -1480,11 +1583,13 @@ Go to this job posting and apply using Easy Apply: {job_url}
 
 7. BLANK PAGE: If page appears empty or stuck loading after clicking Apply, call `check_and_reload_page`. If it says SPA_FAILURE, report failure.
 
-8. SCROLL RULE: The Submit/Continue button is in the page FOOTER, NOT inside the scrollable form. Do NOT scroll the review/form content more than once looking for Submit. Check the main page footer first.
+8. SUBMIT BUTTON: On review/final page, call `click_footer_button` to click Submit. Do NOT scroll looking for it. The button is in the page footer and `click_footer_button` finds it via JS.
 
 9. ANSWERS: Yes/No = "Yes". Work authorization = "Yes". Sponsorship = "No". Self-identification = "I do not want to answer".
 
 10. LOGIN: If asked to login, say "NEEDS_LOGIN". If job expired, say "JOB_UNAVAILABLE".
+
+11. NO RE-NAVIGATION: NEVER navigate to a URL you are already on. If the page looks wrong, wait or call `check_and_reload_page` instead.
 
 === END RULES ===
 
@@ -1499,12 +1604,12 @@ STEPS:
 1. Go to the job URL
 2. Click "Easy Apply" or "Apply now"
 3. Call verify_indeed_easy_apply - if ABORT, say "EXTERNAL_SITE"
-4. If page blank/stuck, call check_and_reload_page
-5. Call inject_form_data to fill form fields (if it fails, type manually)
+4. If page blank/stuck, call check_and_reload_page (do NOT re-navigate to same URL)
+5. Call inject_form_data to fill ALL form fields at once (if it fails, type manually)
 6. Call check_validation_errors, fix errors, click Continue
 7. Self-identification = "I do not want to answer"
 8. Repeat 5-7 for each form page
-9. On review page: Submit button is in the FOOTER (not scrollable area). Click Submit.
+9. On review page: call `click_footer_button` to submit (do NOT scroll looking for button)
 10. Report SUCCESS on confirmation
 
 Say "SUCCESS" on confirmation. "EXTERNAL_SITE" on redirect. "JOB_UNAVAILABLE" if expired. "NEEDS_LOGIN" if login required.
@@ -1619,36 +1724,54 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
     print(f"Recording session to: {gif_path}")
 
     try:
-        print("Starting Browser-Use Cloud agent (v4)...")
+        print("Starting Browser-Use Cloud agent (v5)...")
         result = await agent.run()
 
-        result_str = str(result)
         final_content = ""
 
-        # Parse step history from agent result for logging
+        # Extract step history from agent result using proper API (real timestamps + URLs)
         total_steps = 0
         try:
-            # Extract step count from result
+            if hasattr(result, 'history') and result.history:
+                for step in result.history():
+                    total_steps += 1
+                    step_ts = ""
+                    step_url = ""
+                    if step.metadata:
+                        step_ts = datetime.fromtimestamp(step.metadata.step_start_time).isoformat() if step.metadata.step_start_time else ""
+                    if step.state:
+                        step_url = getattr(step.state, 'url', '') or ''
+                    # Log each action result in this step
+                    for action_result in (step.result or []):
+                        content = action_result.extracted_content or ''
+                        if content and len(content) > 4:
+                            if _active_logger:
+                                _active_logger.log_step(total_steps, 'agent_action', content, url=step_url, ts=step_ts)
+                    # Check for done action
+                    for action_result in (step.result or []):
+                        if action_result.is_done and action_result.extracted_content:
+                            final_content = action_result.extracted_content
+        except Exception as e:
+            # Fallback: regex parsing if API access fails
+            result_str = str(result)
             step_matches = re.findall(r'ActionResult\(', result_str)
             total_steps = len(step_matches) if step_matches else 0
-            # Log extracted_content from each step
             step_contents = re.findall(r'extracted_content=[\'"]([^\'"]{5,200})[\'"]', result_str)
             for i, content in enumerate(step_contents):
                 if _active_logger:
                     _active_logger.log_step(i + 1, 'agent_action', content)
-        except Exception:
-            pass
 
-        # Improved regex - handles quotes and longer content
-        done_pattern = r"is_done=True.*?extracted_content=['\"](.+?)['\"]"
-        matches = re.findall(done_pattern, result_str, re.DOTALL)
-        if matches:
-            final_content = matches[-1]
-        else:
-            # Fallback: look for any extracted_content
-            status_match = re.search(r"extracted_content=['\"]([^'\"]+)['\"]", result_str)
-            if status_match:
-                final_content = status_match.group(1)
+        # Extract final result if not found from history API
+        if not final_content:
+            result_str = str(result)
+            done_pattern = r"is_done=True.*?extracted_content=['\"](.+?)['\"]"
+            matches = re.findall(done_pattern, result_str, re.DOTALL)
+            if matches:
+                final_content = matches[-1]
+            else:
+                status_match = re.search(r"extracted_content=['\"]([^'\"]+)['\"]", result_str)
+                if status_match:
+                    final_content = status_match.group(1)
 
         print(f"Result: {final_content or 'No clear status found'}")
 
@@ -1727,8 +1850,8 @@ async def main(max_jobs: int = 1, dry_run: bool = False, skip_blocked: bool = Tr
     """Main entry point"""
 
     print("\n" + "="*60)
-    print("Indeed Easy Apply Bot v4.0")
-    print("Features: SPA watchdog, loop guard, session logging, iframe scroll fix")
+    print("Indeed Easy Apply Bot v5.0")
+    print("Features: JS form injection, pre-detect external, footer click, improved logging")
     print("="*60)
 
     pending = load_queue("pending")
@@ -1814,6 +1937,20 @@ async def main(max_jobs: int = 1, dry_run: bool = False, skip_blocked: bool = Tr
                 jobs_skipped += 1
                 continue
 
+        # ============ PRE-DETECT EXTERNAL (skip without browser) ============
+        job_url = job.get('url', '')
+        if job_url and 'indeed.com' in job_url:
+            pre_check = pre_detect_easy_apply(job_url)
+            if pre_check == 'external':
+                print(f"\n[PRE-DETECT] {job.get('company')}: External ATS detected (skipped browser launch)")
+                job['apply_result'] = 'external_site'
+                job['apply_timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                external.append(job)
+                save_queue("pending", pending)
+                save_queue("external", external)
+                jobs_processed += 1
+                continue
+
         # ============ APPLY ============
         success, result_reason = await apply_to_job(job)
 
@@ -1857,7 +1994,7 @@ async def main(max_jobs: int = 1, dry_run: bool = False, skip_blocked: bool = Tr
         recent_logs = sorted(session_logs, key=lambda p: p.stat().st_mtime, reverse=True)[:jobs_processed]
         summary_file = LOG_DIR / f"batch_summary_{time.strftime('%Y%m%d_%H%M%S')}.md"
         lines = [f"# Batch Session Summary\n", f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n",
-                 f"**Version:** v4\n", f"**Jobs processed:** {jobs_processed}\n\n",
+                 f"**Version:** v5\n", f"**Jobs processed:** {jobs_processed}\n\n",
                  "| # | Company | Type | Result | Steps | CAPTCHA | Errors |\n",
                  "|---|---------|------|--------|-------|---------|--------|\n"]
         for i, log_path in enumerate(reversed(recent_logs), 1):
@@ -1883,7 +2020,7 @@ async def main(max_jobs: int = 1, dry_run: bool = False, skip_blocked: bool = Tr
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Indeed Easy Apply Bot v4.0")
+    parser = argparse.ArgumentParser(description="Indeed Easy Apply Bot v5.0")
     parser.add_argument("--max", type=int, default=1, help="Max jobs to process")
     parser.add_argument("--dry-run", action="store_true", help="Preview without applying")
     parser.add_argument("--no-skip", action="store_true", help="Don't skip blocked ATS domains")
