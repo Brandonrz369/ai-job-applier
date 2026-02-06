@@ -282,9 +282,14 @@ Use CSS selectors like [name="fieldname"] or #id"""
         return ActionResult(extracted_content=f"Form injection error: {str(e)}")
 
 
-@controller.action('Solve CAPTCHA (Cloudflare Turnstile, reCAPTCHA, or hCaptcha)')
+_captcha_attempt_count = {}  # Track CAPTCHA attempts per URL
+
+@controller.action('Solve CAPTCHA (Cloudflare Turnstile, reCAPTCHA, or hCaptcha) - max 2 retries per page')
 async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
-    """Detect and solve CAPTCHAs using CapSolver API - supports Turnstile, reCAPTCHA, and hCaptcha"""
+    """Detect and solve CAPTCHAs using CapSolver API - supports Turnstile, reCAPTCHA, and hCaptcha.
+    Max 2 attempts per page - if both fail, the session is tainted. Move on."""
+    global _captcha_attempt_count
+
     if not CAPSOLVER_API_KEY:
         return ActionResult(extracted_content="No CAPSOLVER_API_KEY configured")
 
@@ -296,6 +301,18 @@ async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
 
         # Get URL via JavaScript
         page_url = await page.evaluate("() => window.location.href")
+
+        # Track attempts per URL - max 2 before giving up
+        url_key = page_url.split('?')[0][:60]
+        _captcha_attempt_count[url_key] = _captcha_attempt_count.get(url_key, 0) + 1
+        attempt = _captcha_attempt_count[url_key]
+
+        if attempt > 2:
+            print(f"  [CapSolver] CAPTCHA attempt {attempt} - session tainted, giving up")
+            return ActionResult(
+                extracted_content="CAPTCHA_FAILED: Max 2 attempts reached. Session is tainted by anti-bot. "
+                "Stop trying to solve and report failure. Say 'CAPTCHA_BLOCKED' and use done action."
+            )
 
         async with aiohttp.ClientSession() as http_client:
             # ============ 1. Detect CAPTCHA Type ============
@@ -468,60 +485,69 @@ async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
                 return ActionResult(extracted_content="CAPTCHA solved - Turnstile bypassed. Refresh or click verify.")
 
             elif captcha_type == "ReCaptchaV2TaskProxyLess":
+                # Inject token into response fields + trigger all possible callbacks
                 await page.evaluate(f"""
                     () => {{
                         const token = '{escaped_solution}';
+                        // 1. Set value in all response textareas
                         const responseFields = document.querySelectorAll('[name="g-recaptcha-response"], #g-recaptcha-response, textarea[id*="recaptcha-response"]');
                         responseFields.forEach(field => {{
                             field.value = token;
                             field.innerHTML = token;
-                            // Dispatch events for React/Vue forms
                             field.dispatchEvent(new Event('input', {{ bubbles: true }}));
                             field.dispatchEvent(new Event('change', {{ bubbles: true }}));
                         }});
-                        // Try callbacks
+                        // 2. Traverse ___grecaptcha_cfg.clients to find and execute callbacks
+                        // This is the CRITICAL step - Indeed's submit button won't enable without it
                         if (typeof ___grecaptcha_cfg !== 'undefined' && ___grecaptcha_cfg.clients) {{
                             Object.keys(___grecaptcha_cfg.clients).forEach(key => {{
                                 const client = ___grecaptcha_cfg.clients[key];
-                                if (client) {{
-                                    ['callback', 'O', 'response'].forEach(prop => {{
-                                        if (client[prop] && typeof client[prop] === 'function') {{
-                                            try {{ client[prop](token); }} catch(e) {{}}
+                                if (!client) return;
+                                // Deep traverse: check all nested objects for callback functions
+                                const searchCallback = (obj, depth) => {{
+                                    if (!obj || depth > 4) return;
+                                    if (typeof obj === 'function') {{
+                                        try {{ obj(token); }} catch(e) {{}}
+                                        return;
+                                    }}
+                                    if (typeof obj !== 'object') return;
+                                    for (const prop of Object.keys(obj)) {{
+                                        if (typeof obj[prop] === 'function' &&
+                                            (prop === 'callback' || prop.length <= 3)) {{
+                                            try {{ obj[prop](token); }} catch(e) {{}}
+                                        }} else if (typeof obj[prop] === 'object' && obj[prop] !== null) {{
+                                            searchCallback(obj[prop], depth + 1);
                                         }}
-                                    }});
-                                    // Also check nested objects
-                                    Object.keys(client).forEach(subKey => {{
-                                        const sub = client[subKey];
-                                        if (sub && typeof sub === 'object') {{
-                                            ['callback', 'O'].forEach(prop => {{
-                                                if (sub[prop] && typeof sub[prop] === 'function') {{
-                                                    try {{ sub[prop](token); }} catch(e) {{}}
-                                                }}
-                                            }});
-                                        }}
-                                    }});
-                                }}
+                                    }}
+                                }};
+                                searchCallback(client, 0);
                             }});
                         }}
-                        // Also try grecaptcha global callback
-                        if (typeof grecaptcha !== 'undefined' && grecaptcha.callback) {{
-                            try {{ grecaptcha.callback(token); }} catch(e) {{}}
+                        // 3. Try grecaptcha.enterprise callback
+                        if (typeof grecaptcha !== 'undefined') {{
+                            try {{ if (grecaptcha.enterprise) grecaptcha.enterprise.execute(); }} catch(e) {{}}
                         }}
-                        // IMPROVEMENT: Click the checkbox to trigger visual update
-                        const checkbox = document.querySelector('.recaptcha-checkbox-border, .recaptcha-checkbox, [role="checkbox"]');
-                        if (checkbox) checkbox.click();
+                        // 4. Force-enable submit button after token injection (fallback)
+                        setTimeout(() => {{
+                            const submitBtns = document.querySelectorAll('button[name="submit-application"], button[type="submit"], button[id*="submit"]');
+                            submitBtns.forEach(btn => {{
+                                if (btn.disabled) {{
+                                    btn.disabled = false;
+                                    btn.removeAttribute('disabled');
+                                    btn.classList.remove('disabled');
+                                }}
+                            }});
+                        }}, 1500);
                     }}
                 """)
-                print(f"  [CapSolver] reCAPTCHA solved successfully!")
-                # Also try clicking the checkbox via Playwright for extra reliability
-                try:
-                    checkbox = await page.query_selector('.recaptcha-checkbox-border, .recaptcha-checkbox')
-                    if checkbox:
-                        await checkbox.click()
-                        print(f"  [CapSolver] Clicked reCAPTCHA checkbox")
-                except:
-                    pass
-                return ActionResult(extracted_content="CAPTCHA solved - reCAPTCHA token injected and checkbox clicked. Submit button should now be enabled.")
+                print(f"  [CapSolver] reCAPTCHA solved successfully! (attempt {attempt})")
+                # Wait 2s for token to propagate before agent clicks submit
+                await asyncio.sleep(2)
+                return ActionResult(
+                    extracted_content="CAPTCHA solved - reCAPTCHA token injected and callbacks triggered. "
+                    "IMPORTANT: Wait 2 seconds, then click the Submit button. "
+                    "If button is still disabled, try clicking it anyway - it may have been force-enabled."
+                )
 
             return ActionResult(extracted_content=f"Solution injected for {captcha_type}")
 
@@ -562,24 +588,55 @@ async def verify_indeed_easy_apply(browser_session: BrowserSession) -> ActionRes
                 extracted_content=f"ABORT: Left Indeed domain. Current URL: {current_url[:80]}. Say 'EXTERNAL_SITE' and stop."
             )
 
-        # Check if the button says "Apply on company site" (not true Easy Apply)
-        is_external_button = await page.evaluate("""() => {
+        # Check for Easy Apply indicators in the DOM (more reliable than text matching)
+        easy_apply_check = await page.evaluate("""() => {
+            // Strong Easy Apply signals (DOM IDs/attributes Indeed uses)
+            const hasIndeedApplyBtn = !!document.querySelector('#indeedApplyButton, [data-indeed-apply-appurl], .indeed-apply-button');
+            const onSmartApply = window.location.href.includes('smartapply.indeed.com');
+
+            // Check for explicit external redirect button
             const buttons = document.querySelectorAll('button, a');
+            let hasExternalBtn = false;
+            let hasApplyNow = false;
             for (const btn of buttons) {
-                const text = btn.innerText.toLowerCase();
-                if (text.includes('apply on company site') || text.includes('apply externally')) {
-                    return true;
+                const text = (btn.innerText || '').toLowerCase().trim();
+                const href = (btn.getAttribute('href') || '').toLowerCase();
+                // Only flag as external if it's clearly a redirect link (not just text)
+                if (text.includes('apply on company site') && href && !href.includes('indeed.com')) {
+                    hasExternalBtn = true;
+                }
+                if (text === 'apply now' || text === 'easy apply') {
+                    hasApplyNow = true;
                 }
             }
-            return false;
+
+            return {
+                hasIndeedApplyBtn: hasIndeedApplyBtn,
+                onSmartApply: onSmartApply,
+                hasExternalBtn: hasExternalBtn,
+                hasApplyNow: hasApplyNow
+            };
         }""")
 
-        if is_external_button:
+        # If we're already on smartapply.indeed.com, we're in the Easy Apply flow
+        if easy_apply_check.get('onSmartApply'):
+            return ActionResult(extracted_content="CONFIRMED: On Indeed Smart Apply page. This IS Easy Apply. Proceed.")
+
+        # If the Indeed Apply button exists, it's Easy Apply
+        if easy_apply_check.get('hasIndeedApplyBtn') or easy_apply_check.get('hasApplyNow'):
+            if easy_apply_check.get('hasExternalBtn'):
+                return ActionResult(
+                    extracted_content="WARNING: Page has both Apply Now and external link. Check carefully before proceeding."
+                )
+            return ActionResult(extracted_content="CONFIRMED: On Indeed, appears to be Easy Apply. Proceed with application.")
+
+        # Only flag as external if there's clear evidence
+        if easy_apply_check.get('hasExternalBtn'):
             return ActionResult(
-                extracted_content="WARNING: This job requires 'Apply on company site'. NOT Easy Apply. Consider skipping."
+                extracted_content="ABORT: This job requires 'Apply on company site'. Say 'EXTERNAL_SITE' and stop."
             )
 
-        return ActionResult(extracted_content="CONFIRMED: On Indeed, appears to be Easy Apply. Proceed with application.")
+        return ActionResult(extracted_content="CONFIRMED: On Indeed. Proceed with application.")
 
     except Exception as e:
         return ActionResult(extracted_content=f"URL check error: {str(e)}")
@@ -1109,14 +1166,20 @@ def build_task(job: dict, resume_path: str | None) -> str:
 
     resume_instruction = ""
     if resume_path:
+        resume_filename = Path(resume_path).name if resume_path else ""
         resume_instruction = f"""
-RESUME UPLOAD (CRITICAL):
-Do NOT use any pre-filled or saved resume from the Indeed account.
-You MUST upload this specific custom resume file: {resume_path}
-- If a resume is already attached/pre-filled, click "Replace resume" or "Remove" to delete it first
-- Then click "Upload resume" or "Upload new resume" and select: {resume_path}
-- If there is also a cover letter upload option, skip it
-- Make sure the uploaded filename shows the custom file, NOT a default Indeed resume
+=== RESUME UPLOAD (MANDATORY - DO NOT SKIP) ===
+You MUST replace the default resume with the custom tailored one.
+Custom resume file: {resume_path}
+Expected filename after upload: {resume_filename}
+
+STEP-BY-STEP:
+1. Look for any pre-filled resume on the page (Indeed auto-attaches your profile resume)
+2. Click "Replace" or "Remove" or "X" button next to the existing resume
+3. Click "Upload resume" and select: {resume_path}
+4. VERIFY the filename shown matches "{resume_filename}" - if it shows a different filename, repeat steps 2-3
+5. Do NOT skip this step. Do NOT proceed without uploading the custom resume.
+=== END RESUME INSTRUCTIONS ===
 """
 
     job_url = job.get('url', '')
@@ -1207,54 +1270,27 @@ Go to this job posting and apply using Easy Apply: {job_url}
 
 {success_criteria}
 
-=== STRICT OPERATIONAL PROTOCOL (MANDATORY) ===
+=== MANDATORY RULES ===
 
-**1. FORM FILLING STRATEGY - BATCH FIRST (High Priority)**
-- Your **FIRST** move when seeing ANY form inputs must be `inject_form_data`
-- Do NOT click and type into individual fields unless injection fails completely
-- If you must fill manually, use `humanize_form_field` immediately after to trigger React events
+1. FORM FILLING: When you see form inputs (name, email, phone, address fields), call `inject_form_data` FIRST. Do NOT type into fields manually. Manual typing triggers bot detection.
 
-**2. VALIDATION GATE - PRE-FLIGHT CHECK (MANDATORY)**
-- You are FORBIDDEN from clicking "Continue", "Next", "Submit", or "Apply" without first running `check_validation_errors`
-- If errors found, FIX the specific fields listed before attempting to proceed again
+2. RESUME: You MUST upload the custom resume. See RESUME UPLOAD section. Do NOT skip this.
 
-**3. THE 3-STRIKE RULE**
-- If you attempt the exact same action 3 times and it fails or the page does not change, you MUST call `ask_gemini_for_help`
+3. VALIDATION: Before clicking Continue/Next/Submit, call `check_validation_errors`. Fix any errors before proceeding.
 
-**Execution Flow:**
-1. Detect Form -> 2. `inject_form_data` -> 3. `check_validation_errors` -> 4. If Clean: Click Next. If Dirty: Fix -> Go to 3.
+4. CAPTCHA: If you see a CAPTCHA, call `solve_captcha`. It has a max of 2 attempts. If it says CAPTCHA_FAILED, stop and report failure.
 
-=== END PROTOCOL ===
+5. URL CHECK: After clicking Apply, call `verify_indeed_easy_apply`. If it says ABORT, stop and say "EXTERNAL_SITE".
 
-CRITICAL URL CHECK:
-- After clicking Apply, call verify_indeed_easy_apply to check you're still on Indeed
-- If it says "ABORT" or "EXTERNAL_SITE", IMMEDIATELY stop and say "EXTERNAL_SITE"
-- Do NOT continue if the URL leaves indeed.com
+6. STUCK: If same action fails 3 times, call `ask_gemini_for_help` with what's wrong.
 
-IMPORTANT RULES:
-- ONLY proceed if you see "Easy Apply" or a simple "Apply" button on Indeed
-- If button says "Apply on company site" - STOP and say "EXTERNAL_SITE"
-- If you're on Indeed and asked to login - STOP and say "NEEDS_LOGIN"
-- If a dialog box or popup appears, close it immediately
-- Complete ALL pages of the application form
-- Answer all Yes/No qualification questions with "Yes"
+7. PACING: Wait 1-2 seconds between page loads. After radio/checkbox clicks, call `humanize_form_field`.
 
-HUMAN-LIKE PACING:
-- Wait 1-2 seconds after page loads before clicking
-- After clicking radio buttons or checkboxes, call humanize_form_field to ensure React registers the change
-- If you see "Something went wrong" repeatedly, try waiting longer between actions
+8. ANSWERS: Yes/No questions = "Yes". Work authorization = "Yes". Sponsorship = "No". Self-identification = "I do not want to answer".
 
-CAPTCHA HANDLING:
-- If you see "Additional Verification Required" or any CAPTCHA, use the solve_captcha action
-- The solve_captcha action supports Cloudflare Turnstile, reCAPTCHA, AND hCaptcha
-- After calling solve_captcha, wait then refresh or click verify/continue
-- Do NOT give up on CAPTCHAs - always try solve_captcha first
+9. LOGIN: If asked to login, say "NEEDS_LOGIN". If job expired, say "JOB_UNAVAILABLE".
 
-RESCUE MODE (IMPORTANT - USE WHEN STUCK):
-- If you are stuck, confused, or have tried the same action 2+ times without progress, use ask_gemini_for_help
-- Call it with a description of your problem, e.g., ask_gemini_for_help("Cannot find the Submit button")
-- Gemini will analyze the page and give you ONE specific action to take
-- Follow Gemini's advice exactly
+=== END RULES ===
 
 APPLICANT INFO (for Indeed):
 - Full Name: {APPLICANT['name']}
@@ -1296,6 +1332,10 @@ Otherwise explain what went wrong.
 
 async def apply_to_job(job: dict) -> tuple[bool, str]:
     """Apply to a single job using Browser-Use Cloud"""
+    global _captcha_attempt_count, _rescue_attempt_count
+    # Reset CAPTCHA and rescue counters for fresh session
+    _captcha_attempt_count.clear()
+    _rescue_attempt_count.clear()
 
     job_url = job.get('url', '')
     job_title = job.get('title', 'Unknown')
@@ -1444,6 +1484,8 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
 
         if "NEEDS_LOGIN" in final_upper:
             return False, "needs_login"
+        elif "CAPTCHA_BLOCKED" in final_upper or "CAPTCHA_FAILED" in final_upper:
+            return False, "captcha_blocked"
         elif "JOB_UNAVAILABLE" in final_upper or "NO LONGER EXISTS" in final_upper or "JOB POST NO LONGER" in final_upper:
             return False, "job_unavailable"
         elif "EXTERNAL_SITE" in final_upper or "EXTERNAL ATS" in final_upper or "COMPANY SITE" in final_upper:
