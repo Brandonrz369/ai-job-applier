@@ -295,7 +295,7 @@ async def inject_form_data(browser_session: BrowserSession) -> ActionResult:
         if not form_html or len(form_html) < 50:
             return ActionResult(extracted_content="No form found on page")
 
-        # User profile for mapping
+        # User profile for mapping - contact + work + education
         user_profile = {
             'first_name': APPLICANT['name'].split()[0],
             'last_name': APPLICANT['name'].split()[-1] if len(APPLICANT['name'].split()) > 1 else '',
@@ -306,41 +306,131 @@ async def inject_form_data(browser_session: BrowserSession) -> ActionResult:
             'zip': APPLICANT.get('zip_code', '92805'),
             'address': APPLICANT.get('street_address', ''),
             'linkedin': 'linkedin.com/in/brandonruiz',
+            'current_job_title': APPLICANT.get('current_job_title', 'IT Support Specialist'),
+            'current_company': APPLICANT.get('current_company', 'Geek Squad'),
+            'years_experience': APPLICANT.get('years_experience', '5'),
+            'previous_job_title': APPLICANT.get('previous_job_title', 'IT Support Specialist'),
+            'previous_company': APPLICANT.get('previous_company', 'Fusion Contact Centers'),
+            'school': 'Long Beach City College',
+            'degree': 'Computer Science',
+            'graduation_year': '2020',
         }
 
         # Generate field mapping (heuristics first, then LLM if needed)
         def llm_callback(unmatched_fields, profile):
-            # Use Gemini Flash for quick field mapping
+            """
+            v5.3: Category-first prompt + indirect ref_id mapping + JSON response mode.
+            Uses simple field_0/field_1 keys so LLM doesn't mangle CSS selectors.
+            """
             if not GEMINI_AVAILABLE:
                 return {}
             try:
                 client = genai.Client(api_key=GEMINI_API_KEY)
-                fields_desc = "\n".join([f"- {f.get('name') or f.get('id') or f.get('placeholder')}: {f.get('type')}" for f in unmatched_fields])
-                prompt = f"""Map these form fields to user profile values. Return JSON only.
 
-Fields:
-{fields_desc}
+                # Build ref_id→selector map and field descriptions with labels
+                ref_to_selector = {}
+                field_lines = []
+                for i, f in enumerate(unmatched_fields):
+                    ref_id = f"field_{i}"
+                    selector = f"[name=\"{f['name']}\"]" if f.get('name') else (f"#{f['id']}" if f.get('id') else f.get('placeholder', '???'))
+                    ref_to_selector[ref_id] = selector
+                    label = f.get('label', '') or f.get('aria-label', '') or f.get('placeholder', '')
+                    field_lines.append(f"  {ref_id}: type={f.get('type','text')}, label=\"{label}\"")
+                fields_desc = "\n".join(field_lines)
 
-Profile: {json.dumps(profile)}
+                # Category-first profile: separate contact/work/education/screening
+                categorized_profile = {
+                    "contact": {
+                        "first_name": profile.get('first_name', ''),
+                        "last_name": profile.get('last_name', ''),
+                        "email": profile.get('email', ''),
+                        "phone": profile.get('phone', ''),
+                        "city": profile.get('city', ''),
+                        "state": profile.get('state', ''),
+                        "zip": profile.get('zip', ''),
+                        "address": profile.get('address', ''),
+                        "linkedin": profile.get('linkedin', ''),
+                    },
+                    "work_history": {
+                        "current_title": profile.get('current_job_title', ''),
+                        "current_company": profile.get('current_company', ''),
+                        "years_experience": profile.get('years_experience', ''),
+                        "previous_title": profile.get('previous_job_title', ''),
+                        "previous_company": profile.get('previous_company', ''),
+                    },
+                    "education": {
+                        "school": profile.get('school', ''),
+                        "degree": profile.get('degree', ''),
+                        "graduation_year": profile.get('graduation_year', ''),
+                    },
+                    "screening_answers": {
+                        "authorized_to_work_in_us": "Yes",
+                        "require_sponsorship": "No",
+                        "years_of_experience": profile.get('years_experience', '5'),
+                        "willing_to_relocate": "Yes",
+                        "salary_expectation": "70000",
+                        "start_date": "Immediately",
+                        "has_drivers_license": "Yes",
+                        "background_check_ok": "Yes",
+                        "drug_test_ok": "Yes",
+                    },
+                }
 
-Return format: {{"selector": "value", ...}}
-Use CSS selectors like [name="fieldname"] or #id"""
+                prompt = (
+                    "You are a form field mapper for a job application. Map each field to applicant data.\n\n"
+                    "STEP 1: Read each field's label to determine its CATEGORY:\n"
+                    "  - CONTACT: name, email, phone, address, city, state, zip, linkedin\n"
+                    "  - WORK: job title, company, employer, work dates, work city/state\n"
+                    "  - EDUCATION: school, degree, major, GPA, graduation, education dates\n"
+                    "  - SCREENING: yes/no questions, years of experience, authorization, salary\n\n"
+                    "STEP 2: Look up data ONLY in the matching category section below.\n"
+                    "STEP 3: If no match exists in that category, use \"__SKIP__\".\n\n"
+                    "CRITICAL RULES:\n"
+                    "- NEVER put contact data (name/email/phone) into work or education fields\n"
+                    "- NEVER put work data into education fields or vice versa\n"
+                    "- For screening questions, match by semantic meaning of the label\n"
+                    "- Use \"__SKIP__\" liberally — it's better to skip than fill incorrectly\n\n"
+                    f"Form fields:\n{fields_desc}\n\n"
+                    f"Applicant data:\n{json.dumps(categorized_profile, indent=2)}\n\n"
+                    "Return JSON mapping field IDs to values: {\"field_0\": \"value\", \"field_1\": \"__SKIP__\"}"
+                )
 
                 response = client.models.generate_content(
                     model="gemini-2.5-flash",
                     contents=prompt,
-                    config={'temperature': 0.1}
+                    config={'temperature': 0.0, 'response_mime_type': 'application/json'}
                 )
-                # Parse JSON from response
-                text = response.text or ""
-                match = re.search(r'\{[^}]+\}', text, re.DOTALL)
-                if match:
-                    return json.loads(match.group())
+
+                # Parse JSON response (json mode should return clean JSON)
+                text = (response.text or "").strip()
+                # Strip markdown code blocks if present despite json mode
+                if text.startswith("```"):
+                    text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+                try:
+                    mapping = json.loads(text)
+                except (ValueError, TypeError):
+                    match = re.search(r'\{.*\}', text, re.DOTALL)
+                    if match:
+                        mapping = json.loads(match.group())
+                    else:
+                        return {}
+
+                # Remap ref_ids back to real CSS selectors, filter __SKIP__
+                final = {}
+                for ref_id, value in mapping.items():
+                    if value != '__SKIP__' and ref_id in ref_to_selector:
+                        final[ref_to_selector[ref_id]] = value
+
+                print(f"  [Form Injection] LLM mapped {len(final)} fields (skipped {len(mapping) - len(final)})")
+                return final
+
             except Exception as e:
                 print(f"  [Form Injection] LLM mapping error: {e}")
             return {}
 
         field_mapping = generate_field_mapping(form_html, user_profile, llm_callback)
+        print(f"  [Form Injection] Total mapping: {len(field_mapping)} fields")
 
         if not field_mapping:
             return ActionResult(extracted_content="Could not generate field mapping. Use manual form filling.")

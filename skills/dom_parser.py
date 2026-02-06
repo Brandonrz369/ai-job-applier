@@ -10,6 +10,7 @@ from typing import Optional
 
 # Heuristic field patterns - match these WITHOUT calling LLM
 FIELD_PATTERNS = {
+    # Contact info
     'first_name': [
         r'first.?name', r'fname', r'given.?name', r'forename'
     ],
@@ -26,22 +27,33 @@ FIELD_PATTERNS = {
         r'linkedin', r'linked.?in'
     ],
     'city': [
-        r'^city$', r'city.?name'
+        r'\bcity\b', r'city.?name'
     ],
     'state': [
-        r'^state$', r'province', r'region'
+        r'\bstate\b', r'province', r'region'
     ],
     'zip': [
-        r'zip', r'postal', r'post.?code'
+        r'\bzip\b', r'postal', r'post.?code'
     ],
     'address': [
-        r'street', r'address.?1', r'^address$'
+        r'street', r'address.?1', r'\baddress\b'
     ],
+    # Documents
     'resume': [
         r'resume', r'cv', r'curriculum'
     ],
     'cover_letter': [
         r'cover.?letter', r'motivation'
+    ],
+    # Work history
+    'current_job_title': [
+        r'job.?title', r'current.?title', r'position.?title'
+    ],
+    'current_company': [
+        r'current.?company', r'current.?employer', r'company.?name'
+    ],
+    'years_experience': [
+        r'years?.?(?:of)?.?experience', r'total.?experience'
     ],
 }
 
@@ -159,12 +171,25 @@ def extract_relevant_attrs(attrs: str, tag_type: str) -> str:
     return ' '.join(relevant)
 
 
+# Fields that are ambiguous when inside work/education sections
+_CONTEXT_SENSITIVE_FIELDS = {'city', 'state', 'zip', 'address'}
+
+# Patterns that indicate work/education context (NOT contact info)
+_WORK_EDU_CONTEXT = re.compile(
+    r'(job|work|employ|position|company|occupation|school|college|university|'
+    r'education|degree|major|gpa|start.?date|end.?date|graduation|employer|'
+    r'title.?at|experience)',
+    re.IGNORECASE
+)
+
+
 def match_field_heuristically(field_info: dict) -> Optional[str]:
     """
     Try to match a form field to user profile field using heuristics.
     Returns the profile field name if matched, None otherwise.
 
-    This is FREE - no LLM call needed.
+    Context-aware: won't match city/state/zip/address when the field
+    is inside a work history or education section.
     """
     # Combine all identifying info
     identifiers = ' '.join([
@@ -178,6 +203,10 @@ def match_field_heuristically(field_info: dict) -> Optional[str]:
     for profile_field, patterns in FIELD_PATTERNS.items():
         for pattern in patterns:
             if re.search(pattern, identifiers, re.IGNORECASE):
+                # For context-sensitive fields, check if we're in a work/education section
+                if profile_field in _CONTEXT_SENSITIVE_FIELDS:
+                    if _WORK_EDU_CONTEXT.search(identifiers):
+                        return None  # Skip - this is a work/edu field, not contact info
                 return profile_field
 
     return None
@@ -186,19 +215,30 @@ def match_field_heuristically(field_info: dict) -> Optional[str]:
 def extract_form_fields(html: str) -> list[dict]:
     """
     Extract all form fields with their identifying information.
+    Includes associated label text via <label for="id"> matching.
     """
     fields = []
+
+    # Build label map: field_id -> label text
+    label_map = {}
+    for match in re.finditer(r'<label[^>]*for=["\']([^"\']+)["\'][^>]*>(.*?)</label>', html, re.DOTALL | re.IGNORECASE):
+        field_id = match.group(1)
+        label_text = re.sub(r'<[^>]+>', '', match.group(2)).strip()
+        if label_text:
+            label_map[field_id] = label_text
 
     # Find inputs
     for match in re.finditer(r'<input([^>]*)/?>', html, re.IGNORECASE):
         attrs = match.group(1)
+        field_id = extract_attr(attrs, 'id')
         field = {
             'tag': 'input',
             'type': extract_attr(attrs, 'type') or 'text',
             'name': extract_attr(attrs, 'name'),
-            'id': extract_attr(attrs, 'id'),
+            'id': field_id,
             'placeholder': extract_attr(attrs, 'placeholder'),
             'aria-label': extract_attr(attrs, 'aria-label'),
+            'label': label_map.get(field_id, '') if field_id else '',
             'required': 'required' in attrs.lower(),
         }
         fields.append(field)
@@ -206,12 +246,14 @@ def extract_form_fields(html: str) -> list[dict]:
     # Find selects
     for match in re.finditer(r'<select([^>]*)>', html, re.IGNORECASE):
         attrs = match.group(1)
+        field_id = extract_attr(attrs, 'id')
         field = {
             'tag': 'select',
             'type': 'select',
             'name': extract_attr(attrs, 'name'),
-            'id': extract_attr(attrs, 'id'),
+            'id': field_id,
             'aria-label': extract_attr(attrs, 'aria-label'),
+            'label': label_map.get(field_id, '') if field_id else '',
             'required': 'required' in attrs.lower(),
         }
         fields.append(field)
@@ -219,13 +261,15 @@ def extract_form_fields(html: str) -> list[dict]:
     # Find textareas
     for match in re.finditer(r'<textarea([^>]*)>', html, re.IGNORECASE):
         attrs = match.group(1)
+        field_id = extract_attr(attrs, 'id')
         field = {
             'tag': 'textarea',
             'type': 'textarea',
             'name': extract_attr(attrs, 'name'),
-            'id': extract_attr(attrs, 'id'),
+            'id': field_id,
             'placeholder': extract_attr(attrs, 'placeholder'),
             'aria-label': extract_attr(attrs, 'aria-label'),
+            'label': label_map.get(field_id, '') if field_id else '',
             'required': 'required' in attrs.lower(),
         }
         fields.append(field)
