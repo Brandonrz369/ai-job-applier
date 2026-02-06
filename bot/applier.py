@@ -21,7 +21,7 @@ import re
 import time
 import base64
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 import os
@@ -346,15 +346,29 @@ Use CSS selectors like [name="fieldname"] or #id"""
             return ActionResult(extracted_content="Could not generate field mapping. Use manual form filling.")
 
         # Inject the form filler function and execute it
-        # Browser-Use evaluate() requires arrow function format: (...args) => { ... }
+        # Browser-Use evaluate() requires string to START with '(' - no async keyword
+        # Chain .then(JSON.stringify) to ensure result comes back as parseable string
         # Pass field_mapping as argument to avoid JS string escaping issues
         injection_script = (
-            "async (fieldMapping) => {\n"
+            "(fieldMapping) => {\n"
             + FORM_FILLER_JS
-            + "\n; return await injectFormData(fieldMapping);\n}"
+            + "\n; return injectFormData(fieldMapping).then(function(r) { return JSON.stringify(r); });\n}"
         )
 
-        result = await page.evaluate(injection_script, field_mapping)
+        raw_result = await page.evaluate(injection_script, field_mapping)
+
+        # Parse result - may be dict (if evaluate resolves + deserializes) or JSON string
+        if isinstance(raw_result, dict):
+            result = raw_result
+        elif isinstance(raw_result, str):
+            try:
+                result = json.loads(raw_result)
+            except (ValueError, TypeError):
+                print(f"  [Form Injection] Raw result: {str(raw_result)[:300]}")
+                return ActionResult(extracted_content=f"Form injection failed: {str(raw_result)[:100]}. Use manual form filling.")
+        else:
+            print(f"  [Form Injection] Result type: {type(raw_result).__name__}")
+            return ActionResult(extracted_content=f"Form injection returned {type(raw_result).__name__}. Use manual form filling.")
 
         filled = result.get('filled', [])
         failed = result.get('failed', [])
@@ -895,7 +909,6 @@ async def click_footer_button(browser_session: BrowserSession) -> ActionResult:
             return ActionResult(extracted_content="Could not get current page")
 
         result = await page.evaluate("""() => {
-            // Try multiple selectors for the footer submit/continue button
             const selectors = [
                 'button[name="submit-application"]',
                 '.ia-BasePage-footer button[type="submit"]',
@@ -904,6 +917,7 @@ async def click_footer_button(browser_session: BrowserSession) -> ActionResult:
                 '.ia-BasePage-footer button',
                 'button.ia-ContinueButton',
             ];
+            // Pass 1: click enabled buttons
             for (const sel of selectors) {
                 const btn = document.querySelector(sel);
                 if (btn && !btn.disabled) {
@@ -912,12 +926,23 @@ async def click_footer_button(browser_session: BrowserSession) -> ActionResult:
                     return { clicked: true, selector: sel, text: btn.textContent.trim() };
                 }
             }
-            // Try any visible submit-like button as fallback
+            // Pass 2: force-enable and click disabled submit buttons (CAPTCHA token already injected)
+            for (const sel of selectors) {
+                const btn = document.querySelector(sel);
+                if (btn && btn.disabled) {
+                    btn.disabled = false;
+                    btn.scrollIntoView({ block: 'center' });
+                    btn.click();
+                    return { clicked: true, selector: sel + ' (force-enabled)', text: btn.textContent.trim() };
+                }
+            }
+            // Pass 3: fallback - any visible submit-like button
             const allBtns = document.querySelectorAll('button');
             for (const btn of allBtns) {
                 const text = (btn.textContent || '').toLowerCase().trim();
                 if ((text.includes('submit') || text.includes('continue') || text.includes('apply'))
-                    && !btn.disabled && btn.offsetParent !== null) {
+                    && btn.offsetParent !== null) {
+                    if (btn.disabled) btn.disabled = false;
                     btn.scrollIntoView({ block: 'center' });
                     btn.click();
                     return { clicked: true, selector: 'fallback', text: btn.textContent.trim() };
@@ -926,13 +951,20 @@ async def click_footer_button(browser_session: BrowserSession) -> ActionResult:
             return { clicked: false };
         }""")
 
-        if result and result.get('clicked'):
+        # page.evaluate() may return dict or JSON string depending on Browser-Use version
+        if isinstance(result, str):
+            try:
+                import json as _json
+                result = _json.loads(result)
+            except (ValueError, TypeError):
+                return ActionResult(extracted_content=f"Footer click returned unexpected: {str(result)[:200]}")
+
+        if isinstance(result, dict) and result.get('clicked'):
             return ActionResult(
-                extracted_content=f"Clicked footer button: '{result.get('text', 'unknown')}' via {result.get('selector')}. "
-                "Wait for page transition."
+                extracted_content=f"Clicked submit button via JS: '{result.get('text', 'unknown')}'. Wait for page transition."
             )
         return ActionResult(
-            extracted_content="No submit/continue button found in footer. Button may be disabled (check CAPTCHA) or page hasn't loaded."
+            extracted_content="Submit button not found or not ready. Check if CAPTCHA needs solving first (button may be disabled until CAPTCHA is complete)."
         )
 
     except Exception as e:
@@ -1729,24 +1761,35 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
 
         final_content = ""
 
-        # Extract step history from agent result using proper API (real timestamps + URLs)
+        # Extract step history from agent result
+        # Note: step.metadata.step_start_time is often 0 in Browser-Use Cloud,
+        # so we distribute timestamps proportionally between session start/end
         total_steps = 0
         try:
+            all_history = []
             if hasattr(result, 'history') and result.history:
-                for step in result.history():
-                    total_steps += 1
-                    step_ts = ""
-                    step_url = ""
-                    if step.metadata:
-                        step_ts = datetime.fromtimestamp(step.metadata.step_start_time).isoformat() if step.metadata.step_start_time else ""
-                    if step.state:
-                        step_url = getattr(step.state, 'url', '') or ''
-                    # Log each action result in this step
-                    for action_result in (step.result or []):
-                        content = action_result.extracted_content or ''
-                        if content and len(content) > 4:
-                            if _active_logger:
-                                _active_logger.log_step(total_steps, 'agent_action', content, url=step_url, ts=step_ts)
+                all_history = list(result.history())
+
+            # Calculate proportional timestamps
+            session_start = _active_logger.start_time if _active_logger else datetime.now()
+            session_end = datetime.now()
+            duration = (session_end - session_start).total_seconds()
+            num_history = max(len(all_history), 1)
+
+            for i, step in enumerate(all_history):
+                total_steps += 1
+                # Distribute timestamps proportionally across session duration
+                step_ts = (session_start + timedelta(seconds=duration * i / num_history)).isoformat()
+                step_url = ""
+                # Try to extract URL from step state
+                if hasattr(step, 'state') and step.state:
+                    step_url = getattr(step.state, 'url', '') or ''
+                # Log each action result in this step
+                for action_result in (step.result or []):
+                    content = action_result.extracted_content or ''
+                    if content and len(content) > 4:
+                        if _active_logger:
+                            _active_logger.log_step(total_steps, 'agent_action', content, url=step_url, ts=step_ts)
                     # Check for done action
                     for action_result in (step.result or []):
                         if action_result.is_done and action_result.extracted_content:
