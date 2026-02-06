@@ -36,7 +36,7 @@ N8N_WEBHOOK_URL = os.getenv('N8N_WEBHOOK_URL', 'http://localhost:5678/webhook/in
 
 # Search settings
 SEARCH_TERMS = [
-    # Core IT Support
+    # Core IT Support (strongest match)
     "IT Support",
     "Help Desk",
     "Desktop Support",
@@ -53,46 +53,27 @@ SEARCH_TERMS = [
     "IT Administrator",
     "Infrastructure Technician",
     "Junior Sysadmin",
+    "Junior Systems Administrator",
+    "Junior Network Engineer",
 
     # Field/MSP
     "Field Service Technician",
     "MSP Technician",
-    "IT Consultant",
     "IT Field Engineer",
 
-    # Specialty
+    # Specialty (candidate has direct experience)
     "VoIP Technician",
     "NOC Technician",
     "Firewall Administrator",
-    "Network Engineer",
+    "M365 Administrator",
+    "Endpoint Technician",
 
-    # Stretch/Growth roles
-    "Junior DevOps",
-    "Junior Systems Administrator",
-    "Junior Network Engineer",
+    # Stretch (entry-level only)
+    "Junior Security Analyst",
+    "SOC Analyst",
     "IT Coordinator",
-    "IT Analyst",
     "IT Project Coordinator",
-
-    # Business/Tech adjacent
-    "Technical Project Coordinator",
-    "Technical Account Manager",
-    "Solutions Consultant",
-    "Technical Writer",
-    "Customer Success Manager",
     "Implementation Specialist",
-
-    # AI/Automation
-    "Automation Specialist",
-    "Automation Engineer",
-    "Integration Specialist",
-    "RPA Developer",
-    "Workflow Automation",
-    "AI Specialist",
-    "AI Operations",
-    "Prompt Engineer",
-    "No-code Developer",
-    "Low-code Developer",
 ]
 
 LOCATION = 'Anaheim, CA'
@@ -477,8 +458,8 @@ def run_hunt(dry_run=False, max_factory=None):
         # Only add remote searches for key terms (not all 44)
         remote_terms = [
             "IT Support", "Help Desk", "Desktop Support", "Technical Support",
-            "Systems Administrator", "Network Administrator", "IT Analyst",
-            "DevOps", "Automation Engineer", "AI Operations", "Prompt Engineer",
+            "Systems Administrator", "Network Administrator",
+            "IT Technician", "NOC Technician",
         ]
         for term in remote_terms:
             all_searches.append(('indeed_remote', term))
