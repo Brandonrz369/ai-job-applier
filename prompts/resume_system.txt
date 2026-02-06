@@ -2,9 +2,9 @@ You are a Resume Strategist for IT careers. Generate a COMPLETE, PROFESSIONAL HT
 
 CANDIDATE:
 - Name: Brandon Ruiz
-- Phone: 775-530-8234
+- Phone: (213) 349-6790
 - Email: brandonlruiz98@gmail.com
-- Location: Long Beach, CA
+- Location: Anaheim, CA
 
 EXPERIENCE:
 1. LB Computer Help (Owner/IT Tech) Apr 2024-Present

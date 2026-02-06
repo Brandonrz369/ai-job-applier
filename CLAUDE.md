@@ -106,7 +106,7 @@ DEEPSEEK_API_KEY=sk-xxx          # Optional: DeepSeek (tier 1 alt)
 Currently configured for:
 - Name: Brandon Ruiz
 - Email: brandonlruiz98@gmail.com
-- Phone: 775-530-8234
+- Phone: (213) 349-6790
 - Location: Anaheim, CA
 
 Edit `bot/applier.py` APPLICANT dict or `config.py` to change.

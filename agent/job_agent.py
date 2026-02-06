@@ -40,7 +40,7 @@ class Config:
     N8N_WEBHOOK_URL = os.getenv('N8N_WEBHOOK_URL', 'http://n8n:5678/webhook/incoming-job')
     
     # Job Search Settings
-    TARGET_LOCATION = os.getenv('TARGET_LOCATION', 'Long Beach, CA')
+    TARGET_LOCATION = os.getenv('TARGET_LOCATION', 'Anaheim, CA')
     SEARCH_TERMS = [
         'IT Support',
         'Help Desk',
@@ -256,7 +256,7 @@ class JobHunter:
             If there's an application form:
             1. Fill in name: Brandon Ruiz
             2. Fill in email: brandonlruiz98@gmail.com
-            3. Fill in phone: 775-530-8234
+            3. Fill in phone: (213) 349-6790
             4. Upload resume from: {resume_path}
             5. Upload cover letter from: {cover_path} (if there's a field for it)
             6. Answer any simple questions honestly

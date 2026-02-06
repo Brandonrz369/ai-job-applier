@@ -87,7 +87,7 @@ class Config:
     CANDIDATE = {
         'name': 'Brandon Ruiz',
         'email': 'brandonlruiz98@gmail.com',
-        'phone': '775-530-8234',
+        'phone': '(213) 349-6790',
         'location': 'Anaheim, CA'
     }
 

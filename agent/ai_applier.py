@@ -39,9 +39,9 @@ MODEL_FALLBACK = "google/gemini-2.5-flash"
 CONTACT = {
     'first_name': 'Brandon',
     'last_name': 'Ruiz', 
-    'email': 'Loungegamingtv@gmail.com',
-    'phone': '5625551234',
-    'city': 'Long Beach',
+    'email': 'brandonlruiz98@gmail.com',
+    'phone': '(213) 349-6790',
+    'city': 'Anaheim',
     'state': 'CA'
 }
 

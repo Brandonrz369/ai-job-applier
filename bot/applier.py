@@ -900,10 +900,10 @@ STORAGE_STATE_FILE = Path("/root/job_bot/agent/storage_state.json")
 # Applicant info
 APPLICANT = {
     "name": "Brandon Ruiz",
-    "email": "brandonruizmarketing@gmail.com",
+    "email": "brandonlruiz98@gmail.com",
     "email_external": "brandonlruiz98@gmail.com",
     "password_external": os.getenv("INDEED_PASSWORD_EXTERNAL", ""),
-    "phone": "775-530-8234",
+    "phone": "(213) 349-6790",
     "location": "Anaheim, CA",
     "street_address": "1602 Juneau Ave",
     "city": "Anaheim",

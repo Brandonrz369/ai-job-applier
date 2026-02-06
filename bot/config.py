@@ -9,7 +9,7 @@ MODEL_SMART = "google/gemini-2.5-flash-preview"
 CANDIDATE = {
     "name": "Brandon Ruiz",
     "email": "brandonlruiz98@gmail.com",
-    "phone": "775-530-8234",
+    "phone": "(213) 349-6790",
     "location": "Anaheim, CA",
     "summary": "IT Support professional with 6+ years experience in help desk, desktop support, Windows/Linux administration, networking, and customer service."
 }

@@ -15,7 +15,7 @@ from browser_use.browser.session import BrowserSession
 
 # Config
 COOKIES_FILE = Path(__file__).parent / "cookies.json"
-INDEED_EMAIL = "brandonruizmarketing@gmail.com"
+INDEED_EMAIL = "brandonlruiz98@gmail.com"
 INDEED_PASSWORD = os.getenv("INDEED_PASSWORD", "")
 
 async def refresh_indeed_cookies(password: str = None):

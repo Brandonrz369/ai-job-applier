@@ -21,7 +21,7 @@ APPLICANT = {
     "name": "Brandon Ruiz",
     "email": "brandonlruiz98@gmail.com",
     "password": os.getenv("INDEED_PASSWORD", ""),
-    "phone": "775-530-8234",
+    "phone": "(213) 349-6790",
     "location": "Anaheim, CA",
     "linkedin": "linkedin.com/in/yourusername",
     "github": "github.com/brandonrz369",
