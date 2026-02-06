@@ -897,6 +897,9 @@ OUTPUT_DIR = Path("/root/output")
 COOKIES_FILE = Path("/root/job_bot/agent/cookies.json")
 STORAGE_STATE_FILE = Path("/root/job_bot/agent/storage_state.json")
 
+# Browser-Use Cloud persistent profile (preserves login state across sessions)
+CLOUD_PROFILE_ID = os.getenv("BROWSER_USE_PROFILE_ID", "a1aa30b5-ae01-47da-b81e-3b9af733eeb6")
+
 # Applicant info
 APPLICANT = {
     "name": "Brandon Ruiz",
@@ -1322,21 +1325,15 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
     else:
         print("Resume: None found")
 
-    # Load cookies
-    storage_state_path = load_cookies_as_storage_state()
-    if storage_state_path:
-        print(f"Loaded cookies from {storage_state_path}")
-    else:
-        print("WARNING: No cookies found - may need to login")
-
-    # Create cloud browser session
+    # Create cloud browser session with persistent profile
     browser_use_api_key = os.getenv("BROWSER_USE_API_KEY")
     os.environ["BROWSER_USE_API_KEY"] = browser_use_api_key
 
+    print(f"Using cloud profile: {CLOUD_PROFILE_ID}")
     browser = BrowserSession(
         use_cloud=True,
         cloud_proxy_country_code='us',
-        storage_state=storage_state_path,
+        cloud_profile_id=CLOUD_PROFILE_ID,
     )
 
     # Rate limit retry logic (Gemini Priority 1.3 recommendation)
@@ -1499,30 +1496,31 @@ async def main(max_jobs: int = 1, dry_run: bool = False, skip_blocked: bool = Tr
         print("\nNo jobs in pending queue!")
         return
 
-    # ============ COOKIE HEALTH CHECK ============
+    # ============ SESSION HEALTH CHECK ============
     if not dry_run and not skip_health_check:
-        print("\n[HEALTH CHECK] Validating Indeed session...")
-        from playwright.async_api import async_playwright
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            storage_state_path = load_cookies_as_storage_state()
-            context = await browser.new_context(
-                storage_state=storage_state_path if storage_state_path else None,
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        print("\n[HEALTH CHECK] Validating Indeed session via cloud profile...")
+        try:
+            health_browser = BrowserSession(
+                use_cloud=True,
+                cloud_profile_id=CLOUD_PROFILE_ID,
             )
-            page = await context.new_page()
+            await health_browser.start()
+            page = await health_browser.get_current_page()
             session_valid = await check_cookie_health(page)
-            await browser.close()
+            await health_browser.stop()
 
-        if not session_valid:
-            print("\n" + "!"*60)
-            print("WARNING: Indeed session appears EXPIRED!")
-            print("Action required: Re-export cookies from browser")
-            print("File: /root/job_bot/agent/cookies.json")
-            print("!"*60)
-            print("\nContinuing anyway (some jobs may fail with needs_login)...")
-        else:
-            print("[HEALTH CHECK] Session VALID - Cookies are fresh")
+            if not session_valid:
+                print("\n" + "!"*60)
+                print("WARNING: Indeed session appears EXPIRED in cloud profile!")
+                print("Action required: Update cloud profile with fresh login")
+                print(f"Profile ID: {CLOUD_PROFILE_ID}")
+                print("!"*60)
+                print("\nContinuing anyway (some jobs may fail with needs_login)...")
+            else:
+                print("[HEALTH CHECK] Session VALID - Cloud profile is fresh")
+        except Exception as e:
+            print(f"[HEALTH CHECK] Could not validate: {e}")
+            print("Continuing anyway...")
 
     if dry_run:
         print("\n[DRY RUN MODE - No actual applications]")

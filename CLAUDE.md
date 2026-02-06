@@ -99,6 +99,7 @@ GMAIL_EMAIL=xxx                  # Verification code extraction
 GMAIL_APP_PASSWORD=xxx           # Gmail app password
 ANTHROPIC_API_KEY=sk-ant-xxx     # Optional: Claude (tier 3 fallback)
 DEEPSEEK_API_KEY=sk-xxx          # Optional: DeepSeek (tier 1 alt)
+BROWSER_USE_PROFILE_ID=uuid      # Cloud browser profile (preserves Indeed login)
 ```
 
 ## Applicant Info
