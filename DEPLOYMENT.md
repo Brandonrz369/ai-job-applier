@@ -35,7 +35,7 @@ curl -X POST http://localhost:5678/webhook/incoming-job \
     "company": "TestCompany",
     "description": "Looking for IT support with Active Directory, firewall management, and Windows Server experience.",
     "url": "https://indeed.com/test",
-    "location": "Long Beach, CA"
+    "location": "Anaheim, CA"
   }'
 ```
 

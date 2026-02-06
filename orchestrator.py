@@ -4,8 +4,8 @@ Job Bot Orchestrator
 ====================
 Runs the complete job application pipeline:
   1. Scrape jobs (simple_hunter.py)
-  2. Score jobs (Haiku)
-  3. Send to n8n factory for resume generation (Opus)
+  2. Score jobs (Gemini 2.5 Flash)
+  3. Send to n8n factory for resume generation (Gemini)
   4. Apply via Browser-Use Cloud
 
 Usage:
@@ -300,9 +300,9 @@ def log_run_summary(
 
     logger.info("")
     logger.info("COSTS:")
-    logger.info(f"  Haiku (scoring): ${costs['haiku_scoring']}")
+    logger.info(f"  Gemini (scoring): ${costs['haiku_scoring']}")
     if not args.dry_run:
-        logger.info(f"  Opus (factory):  ${costs['opus_factory']}")
+        logger.info(f"  Gemini (factory): ${costs['opus_factory']}")
         logger.info(f"  Browser-Use:     ${costs['browser_use']}")
         logger.info(f"  TOTAL:           ${costs['total']}")
 

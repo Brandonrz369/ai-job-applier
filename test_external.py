@@ -39,7 +39,7 @@ STORAGE_STATE_FILE = Path("/root/job_bot/agent/storage_state_test.json")
 # Applicant info
 APPLICANT = {
     "name": "Brandon Ruiz",
-    "email": "brandonlruiz98@gmail.com",
+    "email": "brandon.ruiz33@outlook.com",
     "phone": "775-530-8234",
     "location": "Anaheim, CA",
     "linkedin": "https://linkedin.com/in/brandonruiz98",

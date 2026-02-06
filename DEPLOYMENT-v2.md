@@ -54,7 +54,7 @@ curl -X POST http://localhost:5678/webhook/incoming-job \
     "company": "TestCompany",
     "description": "Looking for IT professional with Active Directory experience, firewall management (FortiGate preferred), and backup administration (Veeam). Must have strong customer service skills and Windows Server experience.",
     "url": "https://indeed.com/viewjob?id=test123",
-    "location": "Long Beach, CA"
+    "location": "Anaheim, CA"
   }'
 ```
 
@@ -116,7 +116,7 @@ playwright install chromium
 cat > ~/job_bot/.env << 'EOF'
 DEEPSEEK_API_KEY=sk-YOUR_KEY_HERE
 N8N_WEBHOOK_URL=http://localhost:5678/webhook/incoming-job
-TARGET_LOCATION=Long Beach, CA
+TARGET_LOCATION=Anaheim, CA
 REMOTE_RATIO=0.25
 OUTPUT_DIR=/root/job_bot/output
 LOGS_DIR=/root/job_bot/logs

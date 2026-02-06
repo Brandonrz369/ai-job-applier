@@ -9,6 +9,11 @@ IMPROVEMENTS (Feb 2026):
 - Added NaN/bad data filtering
 - Switched to async aiohttp for CAPTCHA solving
 - GEMINI RESCUE SYSTEM: Call Gemini when agent is stuck
+- PHASE 2 IMPROVEMENTS (Feb 2026):
+  - Cookie health check at startup
+  - Stuck detection system
+  - Optimized task prompt with form injection enforcement
+  - Expanded success detection
 """
 import asyncio
 import json
@@ -19,6 +24,15 @@ from pathlib import Path
 from dotenv import load_dotenv
 import os
 import aiohttp
+
+# Import new utilities
+from utils import (
+    StuckDetectionSystem,
+    check_cookie_health,
+    detect_application_success,
+    build_optimized_task,
+    OPTIMIZED_TASK_PROMPT
+)
 
 # Gemini for "Rescue" system
 try:
@@ -674,7 +688,7 @@ async def check_validation_errors(browser_session: BrowserSession) -> ActionResu
 # - Tier 1: Flash with NO thinking for quick tactical fixes
 # - Tier 2: Pro with 4K thinking for complex problems
 # - WAF detection: "Something went wrong" on Indeed = bot block, not logic error
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyBqxiFt6z01sHh_nhfvIPAA1o8FPSZrvCA")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")  # Set in .env file
 
 # Track rescue attempts per session to implement tiered escalation
 _rescue_attempt_count = {}
@@ -808,7 +822,11 @@ Only STOP if truly unrecoverable."""
         return ActionResult(extracted_content=f"GEMINI ADVICE: {advice}")
 
     except Exception as e:
-        return ActionResult(extracted_content=f"Gemini error: {str(e)[:100]}")
+        error_msg = str(e)
+        print(f"  [GEMINI RESCUE] ERROR: {error_msg}")
+        if "PERMISSION_DENIED" in error_msg or "leaked" in error_msg.lower():
+            return ActionResult(extracted_content="GEMINI ERROR: API key invalid or revoked. Please update GEMINI_API_KEY in .env file.")
+        return ActionResult(extracted_content=f"Gemini error: {error_msg[:150]}")
 
 
 # Email verification code reader
@@ -884,7 +902,7 @@ APPLICANT = {
     "name": "Brandon Ruiz",
     "email": "brandonruizmarketing@gmail.com",
     "email_external": "brandonlruiz98@gmail.com",
-    "password_external": "&p0wer2Jah!",
+    "password_external": os.getenv("INDEED_PASSWORD_EXTERNAL", ""),
     "phone": "775-530-8234",
     "location": "Anaheim, CA",
     "street_address": "1602 Juneau Ave",
@@ -946,11 +964,17 @@ def load_cookies_as_storage_state() -> str:
         }
         if cookie.get("expirationDate"):
             pw_cookie["expires"] = cookie.get("expirationDate")
+        # Normalize sameSite value - Playwright only accepts Strict|Lax|None
         same_site = cookie.get("sameSite", "Lax")
-        if same_site == "no_restriction":
+        same_site_lower = str(same_site).lower()
+        if same_site_lower in ["no_restriction", "none"]:
             same_site = "None"
-        elif same_site == "unspecified":
+        elif same_site_lower in ["strict"]:
+            same_site = "Strict"
+        elif same_site_lower in ["lax", "unspecified", ""]:
             same_site = "Lax"
+        else:
+            same_site = "Lax"  # Default fallback
         pw_cookie["sameSite"] = same_site
         pw_cookies.append(pw_cookie)
 
@@ -1180,10 +1204,29 @@ Go to this job posting and apply using Easy Apply: {job_url}
 
 {success_criteria}
 
-CRITICAL URL CHECK (IMPORTANT - READ THIS):
+=== STRICT OPERATIONAL PROTOCOL (MANDATORY) ===
+
+**1. FORM FILLING STRATEGY - BATCH FIRST (High Priority)**
+- Your **FIRST** move when seeing ANY form inputs must be `inject_form_data`
+- Do NOT click and type into individual fields unless injection fails completely
+- If you must fill manually, use `humanize_form_field` immediately after to trigger React events
+
+**2. VALIDATION GATE - PRE-FLIGHT CHECK (MANDATORY)**
+- You are FORBIDDEN from clicking "Continue", "Next", "Submit", or "Apply" without first running `check_validation_errors`
+- If errors found, FIX the specific fields listed before attempting to proceed again
+
+**3. THE 3-STRIKE RULE**
+- If you attempt the exact same action 3 times and it fails or the page does not change, you MUST call `ask_gemini_for_help`
+
+**Execution Flow:**
+1. Detect Form -> 2. `inject_form_data` -> 3. `check_validation_errors` -> 4. If Clean: Click Next. If Dirty: Fix -> Go to 3.
+
+=== END PROTOCOL ===
+
+CRITICAL URL CHECK:
 - After clicking Apply, call verify_indeed_easy_apply to check you're still on Indeed
 - If it says "ABORT" or "EXTERNAL_SITE", IMMEDIATELY stop and say "EXTERNAL_SITE"
-- Do NOT continue if the URL leaves indeed.com - external ATS sites require different handling
+- Do NOT continue if the URL leaves indeed.com
 
 IMPORTANT RULES:
 - ONLY proceed if you see "Easy Apply" or a simple "Apply" button on Indeed
@@ -1193,17 +1236,10 @@ IMPORTANT RULES:
 - Complete ALL pages of the application form
 - Answer all Yes/No qualification questions with "Yes"
 
-HUMAN-LIKE PACING (IMPORTANT - AVOID BOT DETECTION):
+HUMAN-LIKE PACING:
 - Wait 1-2 seconds after page loads before clicking
 - After clicking radio buttons or checkboxes, call humanize_form_field to ensure React registers the change
-- Don't rush - a real human would read the page before clicking
 - If you see "Something went wrong" repeatedly, try waiting longer between actions
-
-VALIDATION CHECK (BEFORE CLICKING CONTINUE/SUBMIT):
-- Call check_validation_errors before clicking Continue or Submit
-- If it finds errors (red text, empty required fields), FIX THEM first
-- Do NOT click Continue/Submit multiple times without fixing errors
-- If you see "Something went wrong" - scroll up and look for red error messages
 
 CAPTCHA HANDLING:
 - If you see "Additional Verification Required" or any CAPTCHA, use the solve_captcha action
@@ -1238,12 +1274,13 @@ STEPS:
 1. Go to the job URL
 2. Find and click "Easy Apply" or "Apply now" button
 3. Call verify_indeed_easy_apply - if it says ABORT, stop and say "EXTERNAL_SITE"
-4. Fill in the applicant info fields if they appear
-5. Call check_validation_errors before clicking Continue
+4. When you see a form with input fields, call inject_form_data to fill ALL fields at once (FAST)
+5. If inject_form_data succeeded, verify fields are filled, then call check_validation_errors
 6. Click Continue on each page (only after validation passes)
 7. On voluntary self-identification pages, select "I do not want to answer"
-8. Click Submit/Apply until done
-9. Report SUCCESS when you see confirmation
+8. Repeat steps 4-6 for each new form page
+9. Click Submit/Apply until done
+10. Report SUCCESS when you see confirmation
 
 When done, say "SUCCESS" if you see any confirmation (submitted, sent, received, thank you).
 If the job redirects to external site, say "EXTERNAL_SITE".
@@ -1379,7 +1416,19 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
 
         print(f"Result: {final_content or 'No clear status found'}")
 
-        # Also check the full result string for success indicators (Gemini's fix)
+        # ============ IMPROVED SUCCESS DETECTION (Phase 2) ============
+        # Try to get the current page for URL/content analysis
+        try:
+            current_page = await browser.get_current_page()
+            if current_page:
+                success_check = await detect_application_success(current_page)
+                if success_check['is_success'] and success_check['confidence'] >= 70:
+                    print(f"  [SUCCESS] Detected via page analysis: {success_check['matched_pattern']} (confidence: {success_check['confidence']}%)")
+                    return True, "applied"
+        except Exception as e:
+            print(f"  [DEBUG] Page-based success detection skipped: {e}")
+
+        # Also check the full result string for success indicators
         result_str_lower = result_str.lower()
 
         # FAST-FAIL: Check for job unavailable in full result
@@ -1425,12 +1474,12 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
             pass
 
 
-async def main(max_jobs: int = 1, dry_run: bool = False, skip_blocked: bool = True):
+async def main(max_jobs: int = 1, dry_run: bool = False, skip_blocked: bool = True, skip_health_check: bool = False):
     """Main entry point"""
 
     print("\n" + "="*60)
-    print("Indeed Easy Apply Bot - Cloud + US Residential Proxy")
-    print("IMPROVED: hCaptcha support, flexible success detection, ATS filtering")
+    print("Indeed Easy Apply Bot v2.0 - OPTIMIZED")
+    print("Features: Form injection, validation gates, stuck detection")
     print("="*60)
 
     pending = load_queue("pending")
@@ -1444,11 +1493,36 @@ async def main(max_jobs: int = 1, dry_run: bool = False, skip_blocked: bool = Tr
     print(f"  Applied: {len(applied)}")
     print(f"  Failed: {len(failed)}")
     print(f"  Skipped: {len(skipped)}")
-    print(f"  External: {len(external)}")  # Jobs that redirect to external ATS
+    print(f"  External: {len(external)}")
 
     if not pending:
         print("\nNo jobs in pending queue!")
         return
+
+    # ============ COOKIE HEALTH CHECK ============
+    if not dry_run and not skip_health_check:
+        print("\n[HEALTH CHECK] Validating Indeed session...")
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            storage_state_path = load_cookies_as_storage_state()
+            context = await browser.new_context(
+                storage_state=storage_state_path if storage_state_path else None,
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            )
+            page = await context.new_page()
+            session_valid = await check_cookie_health(page)
+            await browser.close()
+
+        if not session_valid:
+            print("\n" + "!"*60)
+            print("WARNING: Indeed session appears EXPIRED!")
+            print("Action required: Re-export cookies from browser")
+            print("File: /root/job_bot/agent/cookies.json")
+            print("!"*60)
+            print("\nContinuing anyway (some jobs may fail with needs_login)...")
+        else:
+            print("[HEALTH CHECK] Session VALID - Cookies are fresh")
 
     if dry_run:
         print("\n[DRY RUN MODE - No actual applications]")
@@ -1531,10 +1605,16 @@ async def main(max_jobs: int = 1, dry_run: bool = False, skip_blocked: bool = Tr
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Indeed Easy Apply Bot")
+    parser = argparse.ArgumentParser(description="Indeed Easy Apply Bot v2.0 - OPTIMIZED")
     parser.add_argument("--max", type=int, default=1, help="Max jobs to process")
     parser.add_argument("--dry-run", action="store_true", help="Preview without applying")
     parser.add_argument("--no-skip", action="store_true", help="Don't skip blocked ATS domains")
+    parser.add_argument("--skip-health-check", action="store_true", help="Skip cookie health check at startup")
     args = parser.parse_args()
 
-    asyncio.run(main(max_jobs=args.max, dry_run=args.dry_run, skip_blocked=not args.no_skip))
+    asyncio.run(main(
+        max_jobs=args.max,
+        dry_run=args.dry_run,
+        skip_blocked=not args.no_skip,
+        skip_health_check=args.skip_health_check
+    ))

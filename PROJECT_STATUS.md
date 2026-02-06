@@ -101,7 +101,7 @@ LinkedIn Remote "IT Support": 5 jobs (includes remote jobs)
   - `--remote-only` - Only remote jobs
   - `--local-only` - Only local jobs
   - `--skip-scrape` - Skip to apply phase
-- [x] Cost tracking per run (Haiku, Opus, Browser-Use)
+- [x] Cost tracking per run (Gemini scoring, Gemini factory, Browser-Use)
 - [x] Error handling with timeouts
 - [x] Logging to /root/job_bot/logs/orchestrator_*.log
 
@@ -134,19 +134,19 @@ Remote Focus (Evening, optional):
 ### Cost Projections (per day):
 | Component | Jobs | Unit Cost | Daily Cost |
 |-----------|------|-----------|------------|
-| Haiku scoring | ~200 | $0.001 | ~$0.20 |
-| Opus factory | ~30 | $0.30 | ~$9.00 |
+| Gemini 2.5 Flash scoring | ~200 | $0.001 | ~$0.20 |
+| Gemini PDF factory | ~30 | $0.005 | ~$0.15 |
 | Browser-Use | ~30 | $0.08 | ~$2.40 |
-| **TOTAL** | | | **~$11.60/day** |
+| **TOTAL** | | | **~$2.75/day** |
 
-### Weekly projection: ~$80/week for 150+ applications
+### Weekly projection: ~$20/week for 150+ applications (significantly reduced after migrating from Claude Opus to Gemini)
 
 ---
 
 ## Overall Progress
 - [x] Scraper working (44 local + 17 remote search terms)
-- [x] Scorer working (Haiku with full profile)
-- [x] n8n factory working (Opus resume generation)
+- [x] Scorer working (Gemini 2.5 Flash with full profile)
+- [x] n8n factory working (Gemini resume/cover letter generation)
 - [x] Applier working (Browser-Use Cloud)
 - [x] External sites tested (1/3 success - viable with filtering)
 - [x] Remote capture fixed (LinkedIn + Indeed remote searches)
@@ -162,8 +162,8 @@ Remote Focus (Evening, optional):
 | Browser-Use per step | $0.002 |
 | Browser-Use proxy | ~$0.015/job |
 | Typical Browser-Use job | ~$0.08 |
-| n8n Factory (Opus) | ~$0.30/job |
-| Haiku scoring | ~$0.001/job |
+| n8n Factory (Gemini) | ~$0.005/job |
+| Gemini 2.5 Flash scoring | ~$0.001/job |
 
 ---
 

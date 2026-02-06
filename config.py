@@ -43,16 +43,19 @@ def get_resume_path():
 
 RESUME_PATH = get_resume_path()
 
-# ============ MODELS (with escalation) ============
+# ============ MODELS (LEGACY - used by bot/agent.py and bot/test_easy_apply.py only) ============
+# NOTE: The active applier (bot/applier.py) uses Browser-Use Cloud directly
+# and calls Gemini API for rescue (2.5 Flash tier 1, 3 Pro tier 2).
+# These OpenRouter model tiers are NOT used by the main application flow.
 MODELS = [
     # Tier 1: Cheap, oscillate between these
     {"id": "google/gemini-2.0-flash-001", "name": "Gemini Flash", "steps": 15, "tier": 1},
     {"id": "deepseek/deepseek-chat", "name": "DeepSeek V3", "steps": 15, "tier": 1},
     {"id": "google/gemini-2.0-flash-001", "name": "Gemini Flash v2", "steps": 15, "tier": 1},
-    
+
     # Tier 2: Mid-range
     {"id": "google/gemini-3-pro-preview", "name": "Gemini 3 Pro", "steps": 20, "tier": 2},
-    
+
     # Tier 3: Premium (last resort)
     {"id": "anthropic/claude-sonnet-4-20250514", "name": "Claude Sonnet", "steps": 25, "tier": 3},
 ]

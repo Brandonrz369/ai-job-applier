@@ -1,0 +1,20 @@
+{
+  "job_index": 1,
+  "company": "Pavion",
+  "title": "Jr Account Manager",
+  "url": "https://www.indeed.com/viewjob?jk=bcf22694aff210a5",
+  "timestamp": "20260204_021357",
+  "phases": [
+    {
+      "name": "validation",
+      "duration_seconds": 0.0
+    },
+    {
+      "name": "application",
+      "duration_seconds": 24.39
+    }
+  ],
+  "result": "FAILED",
+  "error": "job_unavailable",
+  "total_time_seconds": 24.39
+}

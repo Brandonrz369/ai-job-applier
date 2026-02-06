@@ -3,7 +3,7 @@
 Job Hunter - Simple Version
 ===========================
 Uses jobspy to scrape Indeed/LinkedIn without browser automation.
-Scores jobs with Claude Haiku, sends passing jobs to n8n for document generation.
+Scores jobs with Gemini 2.5 Flash, sends passing jobs to n8n for document generation.
 
 Usage:
     python simple_hunter.py
@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Job scraping
 from jobspy import scrape_jobs
@@ -95,14 +96,17 @@ SEARCH_TERMS = [
 ]
 
 LOCATION = 'Anaheim, CA'
-RESULTS_PER_SEARCH = 5
+DISTANCE_MILES = 35  # Search radius in miles
+RESULTS_PER_SEARCH = 50  # Get more results per term, dedup handles overlap
 HOURS_OLD = 72  # Jobs posted in last 72 hours
 MAX_JOBS_TOTAL = 50  # Stop after this many jobs sent to factory
+PARALLEL_SEARCHES = 3  # Number of concurrent JobSpy searches (VPS has 3 cores)
+PARALLEL_SCORING = 20  # Number of concurrent job scoring calls
 
 # Remote settings (ratio disabled - keep all remote jobs)
 REMOTE_RATIO = 1.0  # Set to 1.0 to accept ALL remote jobs (no filtering)
-INCLUDE_REMOTE_SEARCHES = True  # Add "remote" suffix searches
-INCLUDE_LINKEDIN = True  # Also search LinkedIn for remote jobs
+INCLUDE_REMOTE_SEARCHES = True  # Add "remote" suffix searches on Indeed
+INCLUDE_LINKEDIN = False  # Disabled - LinkedIn doesn't return descriptions reliably
 
 # Paths
 OUTPUT_DIR = Path('./output')
@@ -200,12 +204,24 @@ def log_skipped_job(job: pd.Series, score_result: dict):
 # N8N INTEGRATION
 # ============================================
 
+def clean_description(desc: str) -> str:
+    """Clean job description for n8n - normalize whitespace and fix escapes"""
+    if not desc:
+        return ""
+    # Fix escaped markdown characters
+    desc = desc.replace('\\-', '-').replace('\\*', '*').replace('\\_', '_')
+    # Normalize all whitespace to single spaces (fixes n8n JSON parsing issues)
+    desc = ' '.join(desc.split())
+    return desc[:3000]  # Truncate to 3000 chars
+
 def send_to_factory(job: pd.Series) -> Dict:
     """Send job to n8n and get back PDF info"""
+    import urllib.request
+
     payload = {
         'title': str(job.get('title', 'Unknown')),
         'company': str(job.get('company', 'Unknown')),
-        'description': str(job.get('description', '')),
+        'description': clean_description(str(job.get('description', ''))),
         'url': str(job.get('job_url', '')),
         'location': str(job.get('location', ''))
     }
@@ -213,20 +229,22 @@ def send_to_factory(job: pd.Series) -> Dict:
     try:
         logger.info(f"  Sending to factory: {payload['company']} - {payload['title']}")
 
-        response = requests.post(
+        data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
             N8N_WEBHOOK_URL,
-            json=payload,
-            headers={'Content-Type': 'application/json'},
-            timeout=120
+            data=data,
+            headers={'Content-Type': 'application/json'}
         )
 
-        if response.status_code in [200, 202]:
-            result = response.json()
-            logger.info(f"  Factory success: Application #{result.get('application_number')}")
-            return result
-        else:
-            logger.error(f"  Factory error: {response.status_code}")
-            return None
+        with urllib.request.urlopen(req, timeout=120) as response:
+            result_text = response.read().decode('utf-8')
+            if result_text:
+                result = json.loads(result_text)
+                logger.info(f"  Factory success: Application #{result.get('application_number')}")
+                return result
+            else:
+                logger.error(f"  Factory error: Empty response")
+                return None
 
     except Exception as e:
         logger.error(f"  Connection failed: {e}")
@@ -245,6 +263,7 @@ def search_jobs(search_term: str, location: str) -> pd.DataFrame:
             site_name=["indeed"],
             search_term=search_term,
             location=location,
+            distance=DISTANCE_MILES,
             results_wanted=RESULTS_PER_SEARCH,
             hours_old=HOURS_OLD,
             country_indeed='USA',
@@ -297,6 +316,7 @@ def search_linkedin_remote(search_term: str) -> pd.DataFrame:
             results_wanted=RESULTS_PER_SEARCH,
             hours_old=HOURS_OLD,
             is_remote=True,  # LinkedIn supports is_remote
+            linkedin_fetch_description=True,  # Fetch full descriptions
         )
 
         logger.info(f"   Found {len(jobs)} LinkedIn remote jobs")
@@ -305,6 +325,41 @@ def search_linkedin_remote(search_term: str) -> pd.DataFrame:
     except Exception as e:
         logger.error(f"   LinkedIn search failed: {e}")
         return pd.DataFrame()
+
+
+def run_parallel_searches(search_list: List[tuple]) -> List[pd.DataFrame]:
+    """Run multiple searches in parallel using ThreadPoolExecutor"""
+    results = []
+
+    def execute_search(search_tuple):
+        search_type, term = search_tuple
+        try:
+            if search_type == 'indeed_local':
+                return search_jobs(term, LOCATION)
+            elif search_type == 'indeed_remote':
+                return search_remote_indeed(term)
+            elif search_type == 'linkedin_remote':
+                return search_linkedin_remote(term)
+        except Exception as e:
+            logger.error(f"Search failed for {term}: {e}")
+            return pd.DataFrame()
+
+    logger.info(f"Running {len(search_list)} searches with {PARALLEL_SEARCHES} threads...")
+    start_time = time.time()
+
+    with ThreadPoolExecutor(max_workers=PARALLEL_SEARCHES) as executor:
+        futures = {executor.submit(execute_search, s): s for s in search_list}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result is not None and not result.empty:
+                    results.append(result)
+            except Exception as e:
+                logger.error(f"Search error: {e}")
+
+    elapsed = time.time() - start_time
+    logger.info(f"Completed {len(search_list)} searches in {elapsed:.1f}s ({elapsed/len(search_list):.2f}s/search avg)")
+    return results
 
 # ============================================
 # MAIN LOOP
@@ -330,6 +385,46 @@ def get_seen_urls() -> set:
         for job in load_queue(queue_name):
             seen.add(job.get('url', ''))
     return seen
+
+def score_single_job(job_data: dict) -> tuple:
+    """Score a single job. Returns (job_data, score_result) for parallel processing."""
+    try:
+        score_result = score_job({
+            'company': job_data['company'],
+            'title': job_data['title'],
+            'location': job_data['location'],
+            'description': job_data['description'][:3000],
+        })
+        return (job_data, score_result)
+    except Exception as e:
+        logger.error(f"Error scoring {job_data.get('title', 'Unknown')}: {e}")
+        return (job_data, {'score': 5, 'recommendation': 'MAYBE', 'reason': f'Error: {e}'})
+
+def run_parallel_scoring(jobs_to_score: list) -> list:
+    """Score multiple jobs in parallel. Returns list of (job_data, score_result) tuples."""
+    results = []
+    total = len(jobs_to_score)
+
+    logger.info(f"Scoring {total} jobs with {PARALLEL_SCORING} parallel threads...")
+
+    with ThreadPoolExecutor(max_workers=PARALLEL_SCORING) as executor:
+        future_to_job = {executor.submit(score_single_job, job): job for job in jobs_to_score}
+
+        completed = 0
+        for future in as_completed(future_to_job):
+            completed += 1
+            try:
+                job_data, score_result = future.result()
+                results.append((job_data, score_result))
+
+                # Log progress
+                rec = score_result.get('recommendation', 'MAYBE')
+                score = score_result.get('score', 5)
+                logger.info(f"[{completed}/{total}] {job_data['company'][:20]} - {job_data['title'][:30]} | {score}/10 {rec}")
+            except Exception as e:
+                logger.error(f"Scoring failed: {e}")
+
+    return results
 
 def run_hunt(dry_run=False, max_factory=None):
     """Main hunting loop.
@@ -397,126 +492,134 @@ def run_hunt(dry_run=False, max_factory=None):
         for term in linkedin_terms:
             all_searches.append(('linkedin_remote', term))
 
-    logger.info(f"Total searches to run: {len(all_searches)}")
+    logger.info(f"Total searches to run: {len(all_searches)} (parallel: {PARALLEL_SEARCHES})")
 
-    for search_type, search_term in all_searches:
-        if not dry_run and total_processed >= factory_limit:
-            break
+    # Run all searches in parallel
+    all_job_results = run_parallel_searches(all_searches)
 
-        # Run appropriate search based on type
-        if search_type == 'indeed_local':
-            jobs = search_jobs(search_term, LOCATION)
-        elif search_type == 'indeed_remote':
-            jobs = search_remote_indeed(search_term)
-        elif search_type == 'linkedin_remote':
-            jobs = search_linkedin_remote(search_term)
+    # Combine all results into one dataframe
+    if all_job_results:
+        combined_jobs = pd.concat(all_job_results, ignore_index=True)
+        logger.info(f"Total jobs found: {len(combined_jobs)}")
+    else:
+        combined_jobs = pd.DataFrame()
+        logger.info("No jobs found")
 
-        if jobs.empty:
-            time.sleep(DELAY_BETWEEN_SEARCHES)
+    # === PHASE 1: Collect jobs to score (filter duplicates and ratio) ===
+    jobs_to_score = []
+    job_raw_data = {}  # Map job_url -> original job row for later processing
+
+    for _, job in combined_jobs.iterrows():
+        job_url = str(job.get('job_url', ''))
+        company = str(job.get('company', 'Unknown'))
+        title = str(job.get('title', 'Unknown'))
+
+        # Skip duplicates
+        if job_url in seen_urls:
             continue
 
-        for _, job in jobs.iterrows():
-            if not dry_run and total_processed >= factory_limit:
-                break
+        # Check 75/25 ratio
+        if not should_apply(job, stats):
+            continue
 
-            job_url = str(job.get('job_url', ''))
-            company = str(job.get('company', 'Unknown'))
-            title = str(job.get('title', 'Unknown'))
+        # Prepare job data for scoring
+        job_data = {
+            'job_url': job_url,
+            'company': company,
+            'title': title,
+            'location': str(job.get('location', '')),
+            'description': str(job.get('description', '')),
+        }
+        jobs_to_score.append(job_data)
+        job_raw_data[job_url] = job
+        seen_urls.add(job_url)
 
-            # Skip duplicates
-            if job_url in seen_urls:
-                continue
+    logger.info(f"Jobs to score (after dedup): {len(jobs_to_score)}")
 
-            # Check 75/25 ratio
-            if not should_apply(job, stats):
-                logger.info(f"  Skipping (remote ratio): {company} - {title}")
-                continue
+    # === PHASE 2: Parallel scoring ===
+    scored_results = run_parallel_scoring(jobs_to_score)
 
-            # === SCORE THE JOB ===
-            logger.info(f"Scoring: {company} - {title[:50]}")
-            score_result = score_job({
-                'company': company,
+    # === PHASE 3: Process scored results ===
+    for job_data, score_result in scored_results:
+        job_url = job_data['job_url']
+        company = job_data['company']
+        title = job_data['title']
+        original_job = job_raw_data.get(job_url)
+
+        recommendation = score_result.get('recommendation', 'MAYBE')
+        score = score_result.get('score', 5)
+        reason = score_result.get('reason', '')
+        total_scored += 1
+
+        # Skip jobs scored NO
+        if recommendation == "NO":
+            log_skipped_job(original_job, score_result)
+            stats['scored_no'] += 1
+            total_skipped += 1
+            continue
+
+        # Track YES/MAYBE
+        total_passed += 1
+        if recommendation == "YES":
+            stats['scored_yes'] += 1
+        else:
+            stats['scored_maybe'] += 1
+
+        if dry_run:
+            # Dry run: log the result but don't send to factory
+            dry_run_results.append({
                 'title': title,
-                'location': str(job.get('location', '')),
-                'description': str(job.get('description', ''))[:3000],
+                'company': company,
+                'url': job_url,
+                'location': job_data['location'],
+                'description': job_data['description'],  # Store for n8n resume factory
+                'score': score,
+                'recommendation': recommendation,
+                'reason': reason,
+                'estimated_salary': score_result.get('estimated_salary', 'Unknown'),
+                'scored_at': datetime.now().isoformat(),
             })
-
-            recommendation = score_result.get('recommendation', 'MAYBE')
-            score = score_result.get('score', 5)
-            reason = score_result.get('reason', '')
-            total_scored += 1
-
-            logger.info(f"   Score: {score}/10 | {recommendation} | {reason}")
-
-            # Skip jobs scored NO
-            if recommendation == "NO":
-                logger.info(f"   SKIPPED (NO): {company} - {title}")
-                log_skipped_job(job, score_result)
-                seen_urls.add(job_url)
-                stats['scored_no'] += 1
-                save_stats(stats)
-                total_skipped += 1
+        else:
+            # Live run: send to factory (but limit to factory_limit)
+            if total_processed >= factory_limit:
                 continue
 
-            # Track YES/MAYBE
-            total_passed += 1
-            if recommendation == "YES":
-                stats['scored_yes'] += 1
-            else:
-                stats['scored_maybe'] += 1
-            save_stats(stats)
-            seen_urls.add(job_url)
+            logger.info(f"Sending to factory: {company} - {title[:40]}")
+            result = send_to_factory(original_job)
 
-            if dry_run:
-                # Dry run: log the result but don't send to factory
-                dry_run_results.append({
+            if result:
+                stats['total'] += 1
+                if is_remote(original_job):
+                    stats['remote'] += 1
+                else:
+                    stats['local'] += 1
+
+                total_processed += 1
+
+                queue_entry = {
+                    'id': str(int(time.time() * 1000)),
                     'title': title,
                     'company': company,
                     'url': job_url,
-                    'location': str(job.get('location', '')),
+                    'location': job_data['location'],
+                    'description': job_data['description'],  # Store for n8n resume factory
+                    'application_number': str(result.get('application_number', '')),
                     'score': score,
                     'recommendation': recommendation,
-                    'reason': reason,
-                    'scored_at': datetime.now().isoformat(),
-                })
-                logger.info(f"   WOULD SEND to factory ({recommendation})")
-            else:
-                # Live run: send to factory
-                logger.info(f"   PASSED ({recommendation}): Sending to factory...")
-                result = send_to_factory(job)
+                    'estimated_salary': score_result.get('estimated_salary', 'Unknown'),
+                    'status': 'pending',
+                    'created_at': datetime.now().isoformat(),
+                }
+                pending.append(queue_entry)
+                save_queue('pending', pending)
 
-                if result:
-                    stats['total'] += 1
-                    if is_remote(job):
-                        stats['remote'] += 1
-                    else:
-                        stats['local'] += 1
-                    save_stats(stats)
+                logger.info(f"   Added to pending queue (#{result.get('application_number')})")
 
-                    total_processed += 1
+            # Rate limiting between factory calls
+            time.sleep(DELAY_BETWEEN_JOBS)
 
-                    queue_entry = {
-                        'id': str(int(time.time() * 1000)),
-                        'title': title,
-                        'company': company,
-                        'url': job_url,
-                        'location': str(job.get('location', '')),
-                        'application_number': str(result.get('application_number', '')),
-                        'score': score,
-                        'recommendation': recommendation,
-                        'status': 'pending',
-                        'created_at': datetime.now().isoformat(),
-                    }
-                    pending.append(queue_entry)
-                    save_queue('pending', pending)
-
-                    logger.info(f"   Added to pending queue (#{result.get('application_number')})")
-                    logger.info("")
-
-                # Rate limiting
-                time.sleep(DELAY_BETWEEN_JOBS)
-
-        time.sleep(DELAY_BETWEEN_SEARCHES)
+    # Save stats once at end
+    save_stats(stats)
 
     # Save dry run results
     if dry_run and dry_run_results:

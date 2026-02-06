@@ -1,0 +1,20 @@
+{
+  "job_index": 5,
+  "company": "AXS",
+  "title": "Sr. Web Analytics Developer",
+  "url": "https://www.indeed.com/viewjob?jk=23bfbd1d3888df78",
+  "timestamp": "20260204_021701",
+  "phases": [
+    {
+      "name": "validation",
+      "duration_seconds": 0.0
+    },
+    {
+      "name": "application",
+      "duration_seconds": 43.42
+    }
+  ],
+  "result": "FAILED",
+  "error": "external_site",
+  "total_time_seconds": 43.42
+}

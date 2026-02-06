@@ -1,0 +1,25 @@
+{
+  "job_index": 0,
+  "company": "KPMG",
+  "title": "Manager, Privileged Access Management Architect and Lead Engineer",
+  "url": "https://www.indeed.com/viewjob?jk=389a291482f6980d",
+  "timestamp": "20260204_021311",
+  "phases": [
+    {
+      "name": "validation",
+      "duration_seconds": 0.0
+    },
+    {
+      "name": "health_check",
+      "duration_seconds": 2.83,
+      "warning": "session_expired"
+    },
+    {
+      "name": "application",
+      "duration_seconds": 30.11
+    }
+  ],
+  "result": "FAILED",
+  "error": "external_site",
+  "total_time_seconds": 32.93
+}

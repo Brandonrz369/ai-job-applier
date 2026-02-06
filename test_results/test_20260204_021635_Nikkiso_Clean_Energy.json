@@ -1,0 +1,20 @@
+{
+  "job_index": 3,
+  "company": "Nikkiso Clean Energy & Industrial Gases",
+  "title": "Technical Sales Specialist",
+  "url": "https://www.indeed.com/viewjob?jk=df9763146cb9a70e",
+  "timestamp": "20260204_021635",
+  "phases": [
+    {
+      "name": "validation",
+      "duration_seconds": 0.0
+    },
+    {
+      "name": "application",
+      "duration_seconds": 23.26
+    }
+  ],
+  "result": "FAILED",
+  "error": "external_site",
+  "total_time_seconds": 23.26
+}

@@ -1,85 +1,124 @@
 # Job Bot - Automated Job Application System
 
 ## Project Purpose
-Automated job application bot that:
+AI-powered autonomous job application bot that:
 1. Scrapes job listings from Indeed/LinkedIn using JobSpy
-2. Generates tailored resumes/cover letters via n8n workflows
-3. Applies to jobs using Browser-Use 1.0 cloud browser automation
+2. Scores job fit using Gemini 2.5 Flash (1-10 scale, threshold 6+)
+3. Generates tailored resumes/cover letters via n8n + Gemini + Gotenberg
+4. Applies to jobs using Browser-Use Cloud with Gemini-powered rescue system
 
 ## Current Architecture
 
 ```
-JobSpy (agent/simple_hunter.py)
+JobSpy Scraper (agent/simple_hunter.py)
+    ↓ Raw listings
+Gemini 2.5 Flash Scorer (agent/scorer.py)
+    ↓ Score >= 6 only
+n8n Webhook → Gemini 2.0 Flash (resume/cover HTML) → Gotenberg (PDF)
+    ↓ Tailored PDFs
+Queue System (queue/pending.json)
     ↓
-n8n Webhook → PDF Generation (Gotenberg)
+Browser-Use Cloud (bot/applier.py)
+  ├── Form injection (JS-based, React-aware)
+  ├── CAPTCHA solving (CapSolver: hCaptcha, Turnstile, reCAPTCHA)
+  ├── Gemini Rescue: Tier 1 = 2.5 Flash, Tier 2 = Gemini 3 Pro (4K thinking)
+  └── Success detection (URL + text + confidence scoring)
     ↓
-Queue (queue/pending.json)
-    ↓
-Browser-Use 1.0 Cloud (bot/applier.py)
-    ↓
-Indeed Easy Apply
+Indeed Easy Apply + External ATS (with guest apply)
 ```
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `agent/simple_hunter.py` | JobSpy scraper, sends jobs to n8n webhook |
-| `bot/applier.py` | Main applier using Browser-Use 1.0 cloud API |
-| `config.py` | Central config (paths, applicant info) |
+| `agent/simple_hunter.py` | JobSpy scraper + Gemini 2.5 Flash scoring, sends to n8n |
+| `agent/scorer.py` | Gemini 2.5 Flash job fit scoring engine |
+| `agent/candidate_profile.py` | Full candidate profile (497 lines) |
+| `bot/applier.py` | Main applier - Browser-Use Cloud + Gemini rescue (1620+ lines) |
+| `bot/utils.py` | Stuck detection, cookie health, success detection |
+| `bot/email_helper.py` | Gmail/Outlook verification code extraction |
+| `config.py` | Central config (paths, applicant info, model tiers) |
+| `orchestrator.py` | Full pipeline orchestration (scrape + apply) |
 | `queue/pending.json` | Jobs waiting to be applied |
 | `queue/applied.json` | Successfully applied jobs |
 | `queue/failed.json` | Failed application attempts |
 | `output/` | Generated resume/cover letter PDFs |
-| `agent/.env` | API keys (BROWSER_USE_API_KEY, etc.) |
+| `infrastructure/` | Docker Compose (n8n, Gotenberg, file server) |
+| `agent/.env` | API keys |
+
+## AI Model Usage
+
+| Purpose | Model | Provider |
+|---------|-------|----------|
+| Job Scoring | Gemini 2.5 Flash | Google AI |
+| Resume/Cover Letter Gen | Gemini 2.0 Flash | Google AI (via n8n) |
+| Browser Agent (primary) | Browser-Use Cloud | Browser-Use |
+| Rescue Tier 1 (fast) | Gemini 2.5 Flash | Google AI |
+| Rescue Tier 2 (deep) | Gemini 3 Pro Preview (4K thinking) | Google AI |
+| Fallback (config.py tiers) | DeepSeek V3, Claude Sonnet | OpenRouter |
 
 ## How to Run
 
-### 1. Scrape Jobs
+### 1. Start Infrastructure
 ```bash
-cd /root/job_bot
-python3 agent/simple_hunter.py
+cd /root/job_bot/infrastructure
+docker-compose up -d  # n8n + Gotenberg + file server
 ```
 
-### 2. Apply to Jobs
+### 2. Scrape + Score Jobs
 ```bash
-# Dry run (preview without applying)
-python3 bot/applier.py --dry-run
+cd /root/job_bot
+python3 agent/simple_hunter.py          # Single run
+python3 agent/simple_hunter.py --loop   # Continuous (every 4 hrs)
+python3 agent/simple_hunter.py --dry-run  # Score only, no factory
+```
 
-# Apply to 1 job
-python3 bot/applier.py --max 1
+### 3. Apply to Jobs
+```bash
+python3 bot/applier.py --dry-run        # Preview without applying
+python3 bot/applier.py --max 1          # Apply to 1 job
+python3 bot/applier.py --max 5          # Apply to multiple
+python3 bot/applier.py --skip-health-check  # Skip cookie validation
+```
 
-# Apply to multiple jobs
-python3 bot/applier.py --max 5
+### 4. Full Pipeline
+```bash
+python3 orchestrator.py --max-factory 30 --max-apply 10
+python3 orchestrator.py --skip-scrape --max-apply 15 --parallel 2
 ```
 
 ## API Keys Required
 
 Store in `/root/job_bot/agent/.env`:
 ```
-BROWSER_USE_API_KEY=bu_xxx    # Browser-Use cloud API
-ANTHROPIC_API_KEY=sk-ant-xxx  # Optional: for Claude
-DEEPSEEK_API_KEY=sk-xxx       # Optional: for DeepSeek
-OPENROUTER_API_KEY=sk-or-xxx  # Optional: for OpenRouter
+GEMINI_API_KEY=xxx               # Gemini (scoring + rescue + n8n gen)
+BROWSER_USE_API_KEY=bu_xxx       # Browser-Use Cloud
+CAPSOLVER_API_KEY=CAP-xxx        # CAPTCHA solving
+OPENROUTER_API_KEY=sk-or-xxx     # Multi-model access (fallback tiers)
+GMAIL_EMAIL=xxx                  # Verification code extraction
+GMAIL_APP_PASSWORD=xxx           # Gmail app password
+ANTHROPIC_API_KEY=sk-ant-xxx     # Optional: Claude (tier 3 fallback)
+DEEPSEEK_API_KEY=sk-xxx          # Optional: DeepSeek (tier 1 alt)
 ```
 
 ## Applicant Info
 
 Currently configured for:
 - Name: Brandon Ruiz
-- Email: brandonhewitt886@gmail.com
-- Phone: 714-598-3651
-- Location: Long Beach, CA
+- Email: brandonlruiz98@gmail.com
+- Phone: 775-530-8234
+- Location: Anaheim, CA
 
-Edit `bot/applier.py` APPLICANT dict to change.
+Edit `bot/applier.py` APPLICANT dict or `config.py` to change.
 
-## Job Application Rules
+## Application Rules
 
-The bot only handles Indeed Easy Apply jobs:
-- Skips non-Indeed URLs
-- Stops if login required → records as `needs_login`
-- Stops if external site redirect → records as `external_site`
-- Stops if complex multi-page form → records as `complex_form`
+- Primary: Indeed Easy Apply (form injection + vision-guided)
+- External ATS: Guest apply supported (Workday, Greenhouse, etc. in blocked list)
+- Skips if login required -> records as `needs_login`
+- Skips if external redirect to blocked ATS -> records as `external_site`
+- CAPTCHA auto-solved via CapSolver (hCaptcha, Turnstile, reCAPTCHA v2)
+- Gemini rescue triggered after 3 consecutive identical failed actions
 
 ## Rate Limiting
 
@@ -90,5 +129,7 @@ The bot only handles Indeed Easy Apply jobs:
 - Uses Browser-Use 1.0 cloud browser (no local Chrome needed)
 - Automatic US residential proxy
 - Vision-enabled for screenshot analysis
+- Max 50 steps per application
+- GIF recording of sessions
 - $0.005 per task (~200 tasks per $1)
 - Dashboard: https://browser-use.com
