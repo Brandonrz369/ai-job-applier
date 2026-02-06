@@ -20,6 +20,8 @@ import json
 import re
 import time
 import base64
+import hashlib
+from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 import os
@@ -177,6 +179,94 @@ sys.path.insert(0, "/root/job_bot")
 from skills.dom_parser import clean_html_for_llm, generate_field_mapping, extract_form_fields, match_field_heuristically
 
 
+# ============ SESSION LOGGER ============
+LOG_DIR = Path("/root/job_bot/logs/sessions")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class SessionLogger:
+    """Structured per-job session logger for 6-step MCP research analysis."""
+
+    def __init__(self, job: dict):
+        self.job = job
+        self.start_time = datetime.now()
+        self.steps = []
+        self.captcha_events = []
+        self.form_events = []
+        self.errors = []
+        self.urls_visited = []
+        self.job_id = job.get('id', job.get('application_number', 'unknown'))
+        company = re.sub(r'[^a-zA-Z0-9]', '_', str(job.get('company', 'Unknown')))[:20]
+        timestamp = self.start_time.strftime('%Y%m%d_%H%M%S')
+        self.log_file = LOG_DIR / f"{company}_{self.job_id}_{timestamp}.json"
+
+    def log_step(self, step_num: int, action: str, details: str, url: str = "", error: str = ""):
+        entry = {
+            'step': step_num,
+            'ts': datetime.now().isoformat(),
+            'elapsed_s': round((datetime.now() - self.start_time).total_seconds(), 1),
+            'action': action,
+            'details': (details or '')[:500],
+            'url': url,
+        }
+        if error:
+            entry['error'] = error
+            self.errors.append({'step': step_num, 'error': error})
+        if url and url not in self.urls_visited:
+            self.urls_visited.append(url)
+        self.steps.append(entry)
+
+    def log_captcha(self, captcha_type: str, attempt: int, success: bool, solve_time_s: float = 0):
+        self.captcha_events.append({
+            'ts': datetime.now().isoformat(),
+            'type': captcha_type,
+            'attempt': attempt,
+            'success': success,
+            'solve_time_s': round(solve_time_s, 1),
+        })
+
+    def log_form_inject(self, filled: int, failed: int, files: int, error: str = ""):
+        self.form_events.append({
+            'ts': datetime.now().isoformat(),
+            'filled': filled,
+            'failed': failed,
+            'files': files,
+            'error': error,
+        })
+
+    def save(self, result: str, success: bool, total_steps: int = 0) -> str:
+        end_time = datetime.now()
+        data = {
+            'job': {
+                'title': self.job.get('title'),
+                'company': self.job.get('company'),
+                'url': self.job.get('url'),
+                'id': self.job_id,
+            },
+            'session': {
+                'start': self.start_time.isoformat(),
+                'end': end_time.isoformat(),
+                'duration_s': round((end_time - self.start_time).total_seconds(), 1),
+                'total_steps': total_steps or len(self.steps),
+                'result': result,
+                'success': success,
+                'version': 'v4',
+            },
+            'captcha': self.captcha_events,
+            'form_injection': self.form_events,
+            'errors': self.errors,
+            'urls_visited': self.urls_visited,
+            'steps': self.steps,
+        }
+        self.log_file.write_text(json.dumps(data, indent=2))
+        print(f"  [LOG] Session saved: {self.log_file}")
+        return str(self.log_file)
+
+
+# Active session logger (set per-job in apply_to_job)
+_active_logger: SessionLogger | None = None
+
+
 @controller.action('Inject form data - fill ALL fields at once using JS injection (much faster than clicking each field)')
 async def inject_form_data(browser_session: BrowserSession) -> ActionResult:
     """
@@ -274,12 +364,24 @@ Use CSS selectors like [name="fieldname"] or #id"""
 
         print(f"  [Form Injection] {summary}")
 
+        # Log to session logger
+        if _active_logger:
+            _active_logger.log_form_inject(len(filled), len(failed), len(files))
+
         return ActionResult(
             extracted_content=f"FORM INJECTED: {summary}. Fields filled: {', '.join(filled[:5])}{'...' if len(filled) > 5 else ''}"
         )
 
     except Exception as e:
-        return ActionResult(extracted_content=f"Form injection error: {str(e)}")
+        error_msg = str(e)
+        print(f"  [Form Injection] ERROR: {error_msg}")
+        if _active_logger:
+            _active_logger.log_form_inject(0, 0, 0, error=error_msg)
+        return ActionResult(
+            extracted_content=f"Form injection failed: {error_msg[:100]}. "
+            "FALLBACK: Type into each field manually using the applicant info. "
+            "Do NOT call inject_form_data again on this page."
+        )
 
 
 _captcha_attempt_count = {}  # Track CAPTCHA attempts per URL
@@ -309,10 +411,13 @@ async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
 
         if attempt > 2:
             print(f"  [CapSolver] CAPTCHA attempt {attempt} - session tainted, giving up")
+            if _active_logger:
+                _active_logger.log_captcha("unknown", attempt, False)
             return ActionResult(
                 extracted_content="CAPTCHA_FAILED: Max 2 attempts reached. Session is tainted by anti-bot. "
                 "Stop trying to solve and report failure. Say 'CAPTCHA_BLOCKED' and use done action."
             )
+        captcha_solve_start = time.time()
 
         async with aiohttp.ClientSession() as http_client:
             # ============ 1. Detect CAPTCHA Type ============
@@ -454,7 +559,10 @@ async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
                         }}
                     }}
                 """)
-                print(f"  [CapSolver] hCaptcha solved successfully!")
+                solve_time = time.time() - captcha_solve_start
+                print(f"  [CapSolver] hCaptcha solved successfully! ({solve_time:.1f}s)")
+                if _active_logger:
+                    _active_logger.log_captcha("hCaptcha", attempt, True, solve_time)
                 return ActionResult(extracted_content="CAPTCHA solved - hCaptcha token injected. Click verify/submit.")
 
             elif captcha_type == "AntiTurnstileTaskProxyLess":
@@ -481,7 +589,10 @@ async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
                         }}
                     }}
                 """)
-                print(f"  [CapSolver] Turnstile solved successfully!")
+                solve_time = time.time() - captcha_solve_start
+                print(f"  [CapSolver] Turnstile solved successfully! ({solve_time:.1f}s)")
+                if _active_logger:
+                    _active_logger.log_captcha("Turnstile", attempt, True, solve_time)
                 return ActionResult(extracted_content="CAPTCHA solved - Turnstile bypassed. Refresh or click verify.")
 
             elif captcha_type == "ReCaptchaV2TaskProxyLess":
@@ -540,7 +651,10 @@ async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
                         }}, 1500);
                     }}
                 """)
-                print(f"  [CapSolver] reCAPTCHA solved successfully! (attempt {attempt})")
+                solve_time = time.time() - captcha_solve_start
+                print(f"  [CapSolver] reCAPTCHA solved successfully! (attempt {attempt}, {solve_time:.1f}s)")
+                if _active_logger:
+                    _active_logger.log_captcha("reCAPTCHA_v2", attempt, True, solve_time)
                 # Wait 2s for token to propagate before agent clicks submit
                 await asyncio.sleep(2)
                 return ActionResult(
@@ -640,6 +754,86 @@ async def verify_indeed_easy_apply(browser_session: BrowserSession) -> ActionRes
 
     except Exception as e:
         return ActionResult(extracted_content=f"URL check error: {str(e)}")
+
+
+# ============ SPA WATCHDOG (v4 - 5/5 consensus) ============
+@controller.action('Check if page loaded - use when page seems blank, stuck, or shows "Preparing review"')
+async def check_and_reload_page(browser_session: BrowserSession) -> ActionResult:
+    """SPA Watchdog: Detects empty/stuck pages and reloads. Use when:
+    - Page appears blank after clicking Apply
+    - "Preparing review" stuck at 100%
+    - No form elements visible"""
+    try:
+        page = await browser_session.get_current_page()
+        if not page:
+            return ActionResult(extracted_content="Could not get current page")
+
+        check = await page.evaluate("""() => {
+            const inputs = document.querySelectorAll('input, button, select, textarea, a');
+            const bodyText = (document.body.innerText || '').trim();
+            const preparing = bodyText.toLowerCase().includes('preparing');
+            return {
+                elementCount: inputs.length,
+                bodyLength: bodyText.length,
+                isPreparing: preparing,
+                url: window.location.href
+            };
+        }""")
+
+        el_count = check.get('elementCount', 0)
+        body_len = check.get('bodyLength', 0)
+        is_preparing = check.get('isPreparing', False)
+
+        # "Preparing review" stuck - scroll to trigger lazy loading
+        if is_preparing:
+            print("  [SPA Watchdog] 'Preparing review' detected - scrolling to trigger load")
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(3)
+            recheck = await page.evaluate("""() => {
+                return {
+                    elementCount: document.querySelectorAll('input, button, select, textarea').length,
+                    isPreparing: (document.body.innerText || '').toLowerCase().includes('preparing')
+                };
+            }""")
+            if recheck.get('isPreparing'):
+                await page.evaluate("window.scrollTo(0, 0)")
+                await asyncio.sleep(2)
+            new_count = recheck.get('elementCount', 0)
+            return ActionResult(
+                extracted_content=f"Scrolled to trigger load. Found {new_count} elements. Continue with the application."
+            )
+
+        # Page seems empty/broken
+        if el_count < 3 or body_len < 100:
+            print(f"  [SPA Watchdog] Page appears empty ({el_count} elements, {body_len} chars). Reloading...")
+            if _active_logger:
+                _active_logger.log_step(0, 'spa_reload', f"Empty page: {el_count} elements", check.get('url', ''))
+            await page.reload(wait_until='networkidle', timeout=15000)
+            await asyncio.sleep(3)
+
+            recheck = await page.evaluate("""() => {
+                return {
+                    elementCount: document.querySelectorAll('input, button, select, textarea').length,
+                    bodyLength: (document.body.innerText || '').trim().length
+                };
+            }""")
+
+            new_count = recheck.get('elementCount', 0)
+            if new_count < 3:
+                return ActionResult(
+                    extracted_content="SPA_FAILURE: Page still empty after reload. This application cannot proceed. "
+                    "Report failure and move to next job."
+                )
+            return ActionResult(
+                extracted_content=f"Page reloaded successfully! Found {new_count} interactive elements. Proceed."
+            )
+
+        return ActionResult(
+            extracted_content=f"Page loaded OK: {el_count} interactive elements found. Proceed normally."
+        )
+
+    except Exception as e:
+        return ActionResult(extracted_content=f"Page check error: {str(e)}. Try scrolling or waiting.")
 
 
 @controller.action('Check for form validation errors before clicking Continue/Submit')
@@ -1270,72 +1464,63 @@ Go to this job posting and apply using Easy Apply: {job_url}
 
 {success_criteria}
 
-=== MANDATORY RULES ===
+=== RULES ===
 
-1. FORM FILLING: When you see form inputs (name, email, phone, address fields), call `inject_form_data` FIRST. Do NOT type into fields manually. Manual typing triggers bot detection.
+1. FORM FILLING: Call `inject_form_data` FIRST when you see form inputs. If it fails, type manually.
 
-2. RESUME: You MUST upload the custom resume. See RESUME UPLOAD section. Do NOT skip this.
+2. RESUME: Upload the custom resume. See RESUME UPLOAD section. Verify filename matches.
 
-3. VALIDATION: Before clicking Continue/Next/Submit, call `check_validation_errors`. Fix any errors before proceeding.
+3. VALIDATION: Call `check_validation_errors` before clicking Continue/Next/Submit.
 
-4. CAPTCHA: If you see a CAPTCHA, call `solve_captcha`. It has a max of 2 attempts. If it says CAPTCHA_FAILED, stop and report failure.
+4. CAPTCHA: Call `solve_captcha` for any CAPTCHA. Max 2 attempts. If CAPTCHA_FAILED, report failure.
 
-5. URL CHECK: After clicking Apply, call `verify_indeed_easy_apply`. If it says ABORT, stop and say "EXTERNAL_SITE".
+5. URL CHECK: After clicking Apply, call `verify_indeed_easy_apply`. If ABORT, say "EXTERNAL_SITE".
 
-6. STUCK: If same action fails 3 times, call `ask_gemini_for_help` with what's wrong.
+6. STUCK: If same action fails 3 times, call `ask_gemini_for_help`.
 
-7. PACING: Wait 1-2 seconds between page loads. After radio/checkbox clicks, call `humanize_form_field`.
+7. BLANK PAGE: If page appears empty or stuck loading after clicking Apply, call `check_and_reload_page`. If it says SPA_FAILURE, report failure.
 
-8. ANSWERS: Yes/No questions = "Yes". Work authorization = "Yes". Sponsorship = "No". Self-identification = "I do not want to answer".
+8. SCROLL RULE: The Submit/Continue button is in the page FOOTER, NOT inside the scrollable form. Do NOT scroll the review/form content more than once looking for Submit. Check the main page footer first.
 
-9. LOGIN: If asked to login, say "NEEDS_LOGIN". If job expired, say "JOB_UNAVAILABLE".
+9. ANSWERS: Yes/No = "Yes". Work authorization = "Yes". Sponsorship = "No". Self-identification = "I do not want to answer".
+
+10. LOGIN: If asked to login, say "NEEDS_LOGIN". If job expired, say "JOB_UNAVAILABLE".
 
 === END RULES ===
 
-APPLICANT INFO (for Indeed):
-- Full Name: {APPLICANT['name']}
-- Email: {APPLICANT['email']}
-- Phone: {APPLICANT['phone']}
-- City/Location: {APPLICANT['location']}
-- Street Address: {APPLICANT.get('street_address', '')}
-- City: {APPLICANT.get('city', 'Anaheim')}
-- State: {APPLICANT.get('state', 'CA')}
-- Zip Code: {APPLICANT.get('zip_code', '92805')}
-
-WORK HISTORY (for "relevant experience" questions):
-- Job Title: IT Support Specialist
-- Company: Geek Squad
-- Years of Experience: 5
+APPLICANT:
+- Name: {APPLICANT['name']} | Email: {APPLICANT['email']} | Phone: {APPLICANT['phone']}
+- Address: {APPLICANT.get('street_address', '')}, {APPLICANT.get('city', 'Anaheim')}, {APPLICANT.get('state', 'CA')} {APPLICANT.get('zip_code', '92805')}
+- Job: IT Support Specialist at Geek Squad | 5 years experience
 
 {resume_instruction}
 
 STEPS:
 1. Go to the job URL
-2. Find and click "Easy Apply" or "Apply now" button
-3. Call verify_indeed_easy_apply - if it says ABORT, stop and say "EXTERNAL_SITE"
-4. When you see a form with input fields, call inject_form_data to fill ALL fields at once (FAST)
-5. If inject_form_data succeeded, verify fields are filled, then call check_validation_errors
-6. Click Continue on each page (only after validation passes)
-7. On voluntary self-identification pages, select "I do not want to answer"
-8. Repeat steps 4-6 for each new form page
-9. Click Submit/Apply until done
-10. Report SUCCESS when you see confirmation
+2. Click "Easy Apply" or "Apply now"
+3. Call verify_indeed_easy_apply - if ABORT, say "EXTERNAL_SITE"
+4. If page blank/stuck, call check_and_reload_page
+5. Call inject_form_data to fill form fields (if it fails, type manually)
+6. Call check_validation_errors, fix errors, click Continue
+7. Self-identification = "I do not want to answer"
+8. Repeat 5-7 for each form page
+9. On review page: Submit button is in the FOOTER (not scrollable area). Click Submit.
+10. Report SUCCESS on confirmation
 
-When done, say "SUCCESS" if you see any confirmation (submitted, sent, received, thank you).
-If the job redirects to external site, say "EXTERNAL_SITE".
-If the job is unavailable or expired, say "JOB_UNAVAILABLE".
-If Indeed requires login, say "NEEDS_LOGIN".
-Otherwise explain what went wrong.
+Say "SUCCESS" on confirmation. "EXTERNAL_SITE" on redirect. "JOB_UNAVAILABLE" if expired. "NEEDS_LOGIN" if login required.
 """
     return task
 
 
 async def apply_to_job(job: dict) -> tuple[bool, str]:
     """Apply to a single job using Browser-Use Cloud"""
-    global _captcha_attempt_count, _rescue_attempt_count
+    global _captcha_attempt_count, _rescue_attempt_count, _active_logger
     # Reset CAPTCHA and rescue counters for fresh session
     _captcha_attempt_count.clear()
     _rescue_attempt_count.clear()
+
+    # Initialize session logger
+    _active_logger = SessionLogger(job)
 
     job_url = job.get('url', '')
     job_title = job.get('title', 'Unknown')
@@ -1428,17 +1613,31 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
         available_file_paths=file_paths,
         max_failures=10,
         max_actions_per_step=5,
-        max_steps=50,
+        max_steps=40,
         generate_gif=gif_path,
     )
     print(f"Recording session to: {gif_path}")
 
     try:
-        print("Starting Browser-Use Cloud agent...")
+        print("Starting Browser-Use Cloud agent (v4)...")
         result = await agent.run()
 
         result_str = str(result)
         final_content = ""
+
+        # Parse step history from agent result for logging
+        total_steps = 0
+        try:
+            # Extract step count from result
+            step_matches = re.findall(r'ActionResult\(', result_str)
+            total_steps = len(step_matches) if step_matches else 0
+            # Log extracted_content from each step
+            step_contents = re.findall(r'extracted_content=[\'"]([^\'"]{5,200})[\'"]', result_str)
+            for i, content in enumerate(step_contents):
+                if _active_logger:
+                    _active_logger.log_step(i + 1, 'agent_action', content)
+        except Exception:
+            pass
 
         # Improved regex - handles quotes and longer content
         done_pattern = r"is_done=True.*?extracted_content=['\"](.+?)['\"]"
@@ -1453,6 +1652,12 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
 
         print(f"Result: {final_content or 'No clear status found'}")
 
+        # Helper to save log and return
+        def _finish(success: bool, reason: str) -> tuple[bool, str]:
+            if _active_logger:
+                _active_logger.save(reason, success, total_steps)
+            return success, reason
+
         # ============ IMPROVED SUCCESS DETECTION (Phase 2) ============
         # Try to get the current page for URL/content analysis
         try:
@@ -1461,7 +1666,7 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
                 success_check = await detect_application_success(current_page)
                 if success_check['is_success'] and success_check['confidence'] >= 70:
                     print(f"  [SUCCESS] Detected via page analysis: {success_check['matched_pattern']} (confidence: {success_check['confidence']}%)")
-                    return True, "applied"
+                    return _finish(True, "applied")
         except Exception as e:
             print(f"  [DEBUG] Page-based success detection skipped: {e}")
 
@@ -1472,38 +1677,43 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
         for keyword in JOB_UNAVAILABLE_KEYWORDS:
             if keyword in result_str_lower:
                 print(f"  [FAST-FAIL] Job unavailable detected: '{keyword}'")
-                return False, "job_unavailable"
+                return _finish(False, "job_unavailable")
 
         # Check for success in the full result string (catches more cases)
         for keyword in SUCCESS_KEYWORDS:
             if keyword in result_str_lower:
                 print(f"  [SUCCESS] Found in full result: '{keyword}'")
-                return True, "applied"
+                return _finish(True, "applied")
 
         final_upper = final_content.upper()
 
         if "NEEDS_LOGIN" in final_upper:
-            return False, "needs_login"
+            return _finish(False, "needs_login")
         elif "CAPTCHA_BLOCKED" in final_upper or "CAPTCHA_FAILED" in final_upper:
-            return False, "captcha_blocked"
+            return _finish(False, "captcha_blocked")
         elif "JOB_UNAVAILABLE" in final_upper or "NO LONGER EXISTS" in final_upper or "JOB POST NO LONGER" in final_upper:
-            return False, "job_unavailable"
+            return _finish(False, "job_unavailable")
         elif "EXTERNAL_SITE" in final_upper or "EXTERNAL ATS" in final_upper or "COMPANY SITE" in final_upper:
-            return False, "external_site"  # Special status for separate queue
+            return _finish(False, "external_site")
+        elif "SPA_FAILURE" in final_upper:
+            return _finish(False, "spa_failure")
 
         # FLEXIBLE SUCCESS MATCHING
         if check_success(final_content):
-            return True, "applied"
+            return _finish(True, "applied")
         if "SUCCESS" in final_upper:
-            return True, "applied"
+            return _finish(True, "applied")
 
         if final_content:
-            return False, final_content[:200]
+            return _finish(False, final_content[:200])
         else:
-            return False, "incomplete"
+            return _finish(False, "incomplete")
 
     except Exception as e:
         print(f"Error: {e}")
+        if _active_logger:
+            _active_logger.log_step(0, 'exception', str(e)[:300], error=str(e)[:200])
+            _active_logger.save(str(e)[:200], False)
         return False, str(e)[:200]
 
     finally:
@@ -1517,8 +1727,8 @@ async def main(max_jobs: int = 1, dry_run: bool = False, skip_blocked: bool = Tr
     """Main entry point"""
 
     print("\n" + "="*60)
-    print("Indeed Easy Apply Bot v2.0 - OPTIMIZED")
-    print("Features: Form injection, validation gates, stuck detection")
+    print("Indeed Easy Apply Bot v4.0")
+    print("Features: SPA watchdog, loop guard, session logging, iframe scroll fix")
     print("="*60)
 
     pending = load_queue("pending")
@@ -1641,11 +1851,39 @@ async def main(max_jobs: int = 1, dry_run: bool = False, skip_blocked: bool = Tr
     print(f"Failed: {len(failed)}")
     print(f"Remaining: {len(pending)}")
 
+    # Generate session summary markdown for 6-step MCP analysis
+    session_logs = list(LOG_DIR.glob("*.json"))
+    if session_logs:
+        recent_logs = sorted(session_logs, key=lambda p: p.stat().st_mtime, reverse=True)[:jobs_processed]
+        summary_file = LOG_DIR / f"batch_summary_{time.strftime('%Y%m%d_%H%M%S')}.md"
+        lines = [f"# Batch Session Summary\n", f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}\n",
+                 f"**Version:** v4\n", f"**Jobs processed:** {jobs_processed}\n\n",
+                 "| # | Company | Type | Result | Steps | CAPTCHA | Errors |\n",
+                 "|---|---------|------|--------|-------|---------|--------|\n"]
+        for i, log_path in enumerate(reversed(recent_logs), 1):
+            try:
+                data = json.loads(log_path.read_text())
+                company = data['job'].get('company', '?')
+                result = data['session'].get('result', '?')
+                steps = data['session'].get('total_steps', 0)
+                success = data['session'].get('success', False)
+                captcha_count = len(data.get('captcha', []))
+                captcha_ok = sum(1 for c in data.get('captcha', []) if c.get('success'))
+                error_count = len(data.get('errors', []))
+                result_icon = 'SUCCESS' if success else result.upper()[:15]
+                captcha_str = f"{captcha_ok}/{captcha_count}" if captcha_count else "N/A"
+                lines.append(f"| {i} | {company} | Easy Apply | {result_icon} | {steps} | {captcha_str} | {error_count} |\n")
+            except Exception:
+                pass
+        lines.append(f"\n**Session logs:** `{LOG_DIR}/`\n")
+        summary_file.write_text(''.join(lines))
+        print(f"\nSession summary: {summary_file}")
+
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Indeed Easy Apply Bot v2.0 - OPTIMIZED")
+    parser = argparse.ArgumentParser(description="Indeed Easy Apply Bot v4.0")
     parser.add_argument("--max", type=int, default=1, help="Max jobs to process")
     parser.add_argument("--dry-run", action="store_true", help="Preview without applying")
     parser.add_argument("--no-skip", action="store_true", help="Don't skip blocked ATS domains")
