@@ -25,7 +25,7 @@ from jobspy import scrape_jobs
 import pandas as pd
 
 # Scoring
-from scorer import score_job
+from scorer import score_job, pre_filter_job, is_duplicate
 
 # ============================================
 # CONFIGURATION
@@ -490,13 +490,32 @@ def run_hunt(dry_run=False, max_factory=None):
     jobs_to_score = []
     job_raw_data = {}  # Map job_url -> original job row for later processing
 
+    pre_filtered_count = 0
+    dedup_count = 0
+
     for _, job in combined_jobs.iterrows():
         job_url = str(job.get('job_url', ''))
         company = str(job.get('company', 'Unknown'))
         title = str(job.get('title', 'Unknown'))
 
-        # Skip duplicates
+        # Skip URL duplicates
         if job_url in seen_urls:
+            continue
+
+        # Skip company+title duplicates (catches Multi-Comm etc.)
+        if is_duplicate(company, title):
+            dedup_count += 1
+            continue
+
+        # Pre-filter: fast Python check before wasting API call
+        passes, reject_reason = pre_filter_job(title)
+        if not passes:
+            pre_filtered_count += 1
+            log_skipped_job(job, {
+                'score': 0, 'recommendation': 'NO',
+                'reason': f'Pre-filter: {reject_reason}'
+            })
+            seen_urls.add(job_url)
             continue
 
         # Check 75/25 ratio
@@ -515,7 +534,9 @@ def run_hunt(dry_run=False, max_factory=None):
         job_raw_data[job_url] = job
         seen_urls.add(job_url)
 
-    logger.info(f"Jobs to score (after dedup): {len(jobs_to_score)}")
+    logger.info(f"Pre-filtered (no API call): {pre_filtered_count}")
+    logger.info(f"Company+title deduped: {dedup_count}")
+    logger.info(f"Jobs to score (after dedup + pre-filter): {len(jobs_to_score)}")
 
     # === PHASE 2: Parallel scoring ===
     scored_results = run_parallel_scoring(jobs_to_score)
@@ -622,6 +643,8 @@ def run_hunt(dry_run=False, max_factory=None):
         logger.info(f"   Estimated factory cost: ${est_cost_low:.2f}-${est_cost_high:.2f}")
         logger.info(f"   Review: cat /root/job_bot/queue/dry_run.json")
         logger.info(f"   Then run live: python3 simple_hunter.py --max {total_passed}")
+    logger.info(f"   Pre-filtered (saved API): {pre_filtered_count}")
+    logger.info(f"   Company+title deduped: {dedup_count}")
     logger.info(f"   Scoring breakdown: YES={stats.get('scored_yes',0)} MAYBE={stats.get('scored_maybe',0)} NO={stats.get('scored_no',0)}")
     if stats['total'] > 0:
         logger.info(f"   Remote: {stats['remote']} ({stats['remote']/stats['total']*100:.1f}%)")
