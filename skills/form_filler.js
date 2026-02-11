@@ -49,14 +49,18 @@ async function injectFormData(fieldMapping, options = {}) {
      * Handle different input types appropriately
      */
     const fillField = async (selector, value) => {
-        // Support multiple selector formats
+        // Support multiple selector formats — use CSS.escape() for IDs with special chars (React :r0: etc.)
         let el = null;
-        if (selector.startsWith('#') || selector.startsWith('.') || selector.startsWith('[')) {
+        if (selector.startsWith('#')) {
+            // Escape the ID portion to handle colons, brackets, etc.
+            const rawId = selector.slice(1);
+            el = document.getElementById(rawId) || document.querySelector('#' + CSS.escape(rawId));
+        } else if (selector.startsWith('.') || selector.startsWith('[')) {
             el = document.querySelector(selector);
         } else {
-            // Try by name, id, or aria-label
+            // Try by name, then by attribute ID (safe for special chars), then fuzzy
             el = document.querySelector(`[name="${selector}"]`) ||
-                 document.querySelector(`#${selector}`) ||
+                 document.getElementById(selector) ||
                  document.querySelector(`[aria-label*="${selector}" i]`) ||
                  document.querySelector(`[placeholder*="${selector}" i]`);
         }

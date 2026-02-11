@@ -52,6 +52,7 @@ from browser_use import Agent, Controller
 from browser_use.agent.views import ActionResult
 from browser_use.browser.profile import BrowserProfile, ProxySettings
 from browser_use.browser.session import BrowserSession
+from browser_use.llm.browser_use import ChatBrowserUse
 
 # SDK for cloud file uploads
 from browser_use_sdk import AsyncBrowserUse
@@ -196,6 +197,9 @@ class SessionLogger:
         self.form_events = []
         self.errors = []
         self.urls_visited = []
+        self.cover_letter_available = False
+        self.stuck_rescued = False
+        self.rescue_reason = ""
         self.job_id = job.get('id', job.get('application_number', 'unknown'))
         company = re.sub(r'[^a-zA-Z0-9]', '_', str(job.get('company', 'Unknown')))[:20]
         timestamp = self.start_time.strftime('%Y%m%d_%H%M%S')
@@ -256,6 +260,13 @@ class SessionLogger:
             },
             'captcha': self.captcha_events,
             'form_injection': self.form_events,
+            'cover_letter': {
+                'available': self.cover_letter_available,
+            },
+            'rescue': {
+                'triggered': self.stuck_rescued,
+                'reason': self.rescue_reason,
+            } if self.stuck_rescued else None,
             'errors': self.errors,
             'urls_visited': self.urls_visited,
             'steps': self.steps,
@@ -332,7 +343,7 @@ async def inject_form_data(browser_session: BrowserSession) -> ActionResult:
                 field_lines = []
                 for i, f in enumerate(unmatched_fields):
                     ref_id = f"field_{i}"
-                    selector = f"[name=\"{f['name']}\"]" if f.get('name') else (f"#{f['id']}" if f.get('id') else f.get('placeholder', '???'))
+                    selector = f"[name=\"{f['name']}\"]" if f.get('name') else (f"[id=\"{f['id']}\"]" if f.get('id') else f.get('placeholder', '???'))
                     ref_to_selector[ref_id] = selector
                     label = f.get('label', '') or f.get('aria-label', '') or f.get('placeholder', '')
                     field_lines.append(f"  {ref_id}: type={f.get('type','text')}, label=\"{label}\"")
@@ -1159,11 +1170,154 @@ async def check_validation_errors(browser_session: BrowserSession) -> ActionResu
         return ActionResult(extracted_content=f"Validation check error: {str(e)}")
 
 
-# ============ GEMINI TIERED RESCUE SYSTEM ============
-# Based on Gemini 3 Pro deep analysis recommendations:
-# - Tier 1: Flash with NO thinking for quick tactical fixes
-# - Tier 2: Pro with 4K thinking for complex problems
-# - WAF detection: "Something went wrong" on Indeed = bot block, not logic error
+# ============ BROWSER STATE SNAPSHOT (for de-escalation decisions) ============
+# Captures URL + interactive element count before intervention.
+# After bu-2-0 runs, compare snapshot to detect real progress.
+
+async def snapshot_browser_state(browser) -> dict:
+    """Capture lightweight browser state for progress comparison."""
+    try:
+        page = await browser.get_current_page()
+        if not page:
+            return {'url': '', 'path': '', 'input_count': 0, 'button_texts': ''}
+        url = await page.evaluate("() => window.location.href")
+        input_count = await page.evaluate("() => document.querySelectorAll('input, select, textarea').length")
+        button_texts = await page.evaluate("""() => {
+            return Array.from(document.querySelectorAll('button, input[type="submit"]'))
+                .filter(b => b.offsetParent !== null)
+                .map(b => b.innerText.trim().substring(0, 20))
+                .slice(0, 8).join('|');
+        }""")
+        from urllib.parse import urlparse
+        path = urlparse(url).path if url else ''
+        return {'url': url, 'path': path, 'input_count': input_count, 'button_texts': button_texts}
+    except Exception:
+        return {'url': '', 'path': '', 'input_count': 0, 'button_texts': ''}
+
+
+def detect_progress(before: dict, after: dict) -> bool:
+    """Compare two browser state snapshots. Returns True if real progress was made."""
+    # Gold Standard: URL path changed (navigated to new page)
+    if before['path'] and after['path'] and before['path'] != after['path']:
+        return True
+    # SPA fallback: same URL but different interactive elements (form page changed)
+    if before['path'] == after['path'] and before['input_count'] > 0:
+        input_delta = abs(after['input_count'] - before['input_count'])
+        buttons_changed = before['button_texts'] != after['button_texts']
+        if input_delta >= 2 or buttons_changed:
+            return True
+    return False
+
+
+# ============ STUCK DETECTOR (Programmatic) ============
+# Replaces unreliable prompt-based "Rule 6" detection.
+# Uses URL + action fingerprinting via on_step_end hook.
+
+class StuckDetector:
+    """Detects agent loops via state fingerprinting — no LLM self-reporting needed."""
+
+    def __init__(self, window=3):
+        self.window = window  # Number of repeated states to trigger
+        self.triggered = False
+        self.trigger_step = 0
+        self.trigger_reason = ""
+        self._fingerprints = []
+
+    async def on_step_end(self, agent):
+        """Hook: called after every agent step via agent.run(on_step_end=...)"""
+        if self.triggered:
+            return  # Already flagged, let the stop propagate
+
+        history = agent.history.history
+        if len(history) < self.window:
+            return
+
+        recent = history[-self.window:]
+
+        # Build fingerprints: URL + action string
+        fps = []
+        for h in recent:
+            url = h.state.url if h.state else ""
+            action = str(h.model_output.action)[:200] if (h.model_output and h.model_output.action) else "none"
+            fps.append(f"{url}|{action}")
+
+        # Stuck if all fingerprints identical (same URL + same action repeated)
+        loop_stuck = len(set(fps)) == 1 and fps[0].split("|")[1] != "none"
+
+        # Also stuck if 3+ consecutive failures (agent.state tracks this)
+        failure_stuck = agent.state.consecutive_failures >= 3
+
+        if loop_stuck or failure_stuck:
+            n = agent.state.n_steps
+            reason = "loop" if loop_stuck else "consecutive_failures"
+            self.triggered = True
+            self.trigger_step = n
+            self.trigger_reason = f"{reason}@step{n}"
+            url_short = fps[-1].split("|")[0][:60] if fps else "?"
+            print(f"  [STUCK DETECTOR] {self.trigger_reason} — URL: {url_short}")
+            agent.state.stopped = True  # Graceful stop — run() loop will break
+
+
+async def gemini_rescue_analysis(browser, task_summary: str, attempt: int = 1) -> str:
+    """Standalone Gemini 3 Pro rescue — called by orchestrator, not by agent."""
+    if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
+        return "Gemini not available"
+
+    try:
+        page = await browser.get_current_page()
+        if not page:
+            return "Could not get page for analysis"
+
+        current_url = await page.evaluate("() => window.location.href")
+        visible_text = await page.evaluate("() => document.body.innerText.substring(0, 1500)")
+        error_messages = await page.evaluate("""() => {
+            const errors = [];
+            document.querySelectorAll('.error, .invalid, [class*="error"], [aria-invalid="true"]').forEach(el => {
+                const t = el.innerText.trim();
+                if (t && t.length < 200 && el.offsetParent !== null) errors.push(t);
+            });
+            return errors.slice(0, 5).join(' | ');
+        }""")
+        buttons = await page.evaluate("""() => {
+            const btns = [];
+            document.querySelectorAll('button, input[type="submit"], a[role="button"]').forEach((b, i) => {
+                if (b.offsetParent !== null && i < 10) btns.push(b.innerText.trim().substring(0, 30));
+            });
+            return btns.join(', ');
+        }""")
+
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        thinking_budget = 2048 if attempt == 1 else 4096
+        print(f"  [RESCUE ANALYSIS] Gemini 3 Pro ({thinking_budget} thinking)")
+
+        prompt = f"""Browser automation agent is STUCK applying for a job.
+URL: {current_url}
+Task: {task_summary}
+Errors: {error_messages or 'None visible'}
+Buttons: {buttons or 'None found'}
+Page text: {visible_text[:1000]}
+
+{"What ONE action unblocks this?" if attempt == 1 else "DEEP ANALYZE: Why is the form stuck? Consider hidden validation, React hydration, modal overlays, wrong element."}
+Be SPECIFIC: mention exact button text, form field name, or CSS selector."""
+
+        response = client.models.generate_content(
+            model="gemini-3-pro-preview",
+            contents=prompt,
+            config={'temperature': 0.3, 'thinking_config': {'thinking_budget': thinking_budget}}
+        )
+        advice = response.text.strip() if response.text else "No response"
+        print(f"  [RESCUE ANALYSIS] Advice: {advice[:150]}")
+        return advice
+
+    except Exception as e:
+        print(f"  [RESCUE ANALYSIS] Error: {e}")
+        return f"Rescue analysis failed: {str(e)[:100]}"
+
+
+# ============ GEMINI RESCUE SYSTEM (Agent-callable — belt and suspenders) ============
+# Kept alongside programmatic stuck detection. Agent can still self-report.
+# Always use Gemini 3 Pro with thinking.
+# WAF detection: "Something went wrong" on Indeed = bot block, not logic error.
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")  # Set in .env file
 
 # Track rescue attempts per session to implement tiered escalation
@@ -1173,9 +1327,9 @@ _rescue_attempt_count = {}
 @controller.action('Ask Gemini for help when stuck (RESCUE MODE - use when confused or stuck in a loop)')
 async def ask_gemini_for_help(browser_session: BrowserSession, problem_description: str = "I am stuck") -> ActionResult:
     """
-    TIERED RESCUE SYSTEM:
-    - Tier 1 (first call): Gemini Flash, NO thinking - fast tactical fix
-    - Tier 2 (repeat calls): Gemini 3 Pro, 4K thinking - deep analysis
+    RESCUE SYSTEM (Gemini 3 Pro only):
+    - Attempt 1: Pro with 2K thinking — focused tactical fix
+    - Attempt 2+: Pro with 4K thinking — deep analysis, root cause
     - WAF Detection: Identifies bot blocks vs logic errors
     """
     global _rescue_attempt_count
@@ -1252,45 +1406,27 @@ Page: {visible_text[:1000]}"""
 
         client = genai.Client(api_key=GEMINI_API_KEY)
 
-        # ============ TIER 1: Fast Tactical (Flash, no thinking) ============
-        if attempt == 1:
-            print(f"  [GEMINI RESCUE] Tier 1: Flash (no thinking)")
-            prompt = f"""UI navigator for job application bot. Quick fix needed.
+        # Scale thinking budget: first rescue = focused 2K, repeat = deep 4K
+        thinking_budget = 2048 if attempt == 1 else 4096
+        print(f"  [GEMINI RESCUE] Pro with {thinking_budget} thinking (attempt {attempt})")
+
+        prompt = f"""You are debugging a stuck job application bot that uses browser automation.
 
 {context}
 
-Output ONE action: CLICK: [button] / TYPE: [field]=[value] / SCROLL: [up/down] / WAIT: [reason] / STOP: [reason]"""
-
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt,
-                config={'temperature': 0.2}  # No thinking config = no thinking
-            )
-
-        # ============ TIER 2: Deep Analysis (Pro, 4K thinking) ============
-        else:
-            print(f"  [GEMINI RESCUE] Tier 2: Pro with thinking (attempt {attempt})")
-            prompt = f"""You are debugging a stuck job application bot. Tier 1 fast fix failed.
-
-{context}
-
-DEEP ANALYZE: Why is the form not progressing? Consider:
-- Hidden validation errors
-- Form state not updating (React hydration)
-- Modal/overlay blocking interaction
-- Wrong element being clicked
+{"Quick fix needed — what ONE action unblocks this?" if attempt == 1 else "DEEP ANALYZE: Tier 1 fix failed. Why is the form not progressing? Consider: hidden validation errors, React hydration issues, modal/overlay blocking, wrong element targeted."}
 
 Output ONE action: CLICK: [button] / TYPE: [field]=[value] / SCROLL: [up/down] / WAIT: [reason] / STOP: [reason]
 Only STOP if truly unrecoverable."""
 
-            response = client.models.generate_content(
-                model="gemini-3-pro-preview",
-                contents=prompt,
-                config={
-                    'temperature': 0.3,
-                    'thinking_config': {'thinking_budget': 4096}  # Capped at 4K per Gemini's recommendation
-                }
-            )
+        response = client.models.generate_content(
+            model="gemini-3-pro-preview",
+            contents=prompt,
+            config={
+                'temperature': 0.3,
+                'thinking_config': {'thinking_budget': thinking_budget}
+            }
+        )
 
         advice = response.text.strip() if response.text else "WAIT: No response from Gemini"
         print(f"  [GEMINI RESCUE] Advice: {advice}")
@@ -1567,6 +1703,24 @@ def get_resume_path(job: dict) -> str | None:
     return None
 
 
+def get_cover_letter_path(job: dict) -> str | None:
+    """Find cover letter PDF for this job"""
+    company = str(job.get('company', '')).replace(' ', '_').replace('/', '_')[:30]
+    app_num = job.get('application_number', '')
+
+    patterns = [
+        f"{company}_{app_num}_CoverLetter.pdf",
+        f"{company}_*_CoverLetter.pdf",
+        f"*_{app_num}_CoverLetter.pdf",
+    ]
+
+    for pattern in patterns:
+        matches = list(OUTPUT_DIR.glob(pattern))
+        if matches:
+            return str(sorted(matches, key=lambda x: x.stat().st_mtime, reverse=True)[0])
+    return None
+
+
 def is_indeed_url(url: str) -> bool:
     return "indeed.com" in url.lower()
 
@@ -1580,7 +1734,7 @@ def check_success(content: str) -> bool:
     return False
 
 
-def build_task(job: dict, resume_path: str | None) -> str:
+def build_task(job: dict, resume_path: str | None, cover_letter_path: str | None = None) -> str:
     """Build task prompt for Browser-Use agent"""
 
     resume_instruction = ""
@@ -1599,6 +1753,21 @@ STEP-BY-STEP:
 4. VERIFY the filename shown matches "{resume_filename}" - if it shows a different filename, repeat steps 2-3
 5. Do NOT skip this step. Do NOT proceed without uploading the custom resume.
 === END RESUME INSTRUCTIONS ===
+"""
+
+    cover_letter_instruction = ""
+    if cover_letter_path:
+        cl_filename = Path(cover_letter_path).name
+        cover_letter_instruction = f"""
+=== COVER LETTER (SUPPORTING DOCUMENT - OPTIONAL) ===
+A tailored cover letter is available: {cover_letter_path}
+Filename: {cl_filename}
+
+If the application has an "Additional documents", "Supporting documents", or "Cover letter" upload option:
+- Upload this file as the cover letter or supporting document
+- Do NOT waste time looking for this option if it's not visible — just skip it
+- This is LOWER priority than completing the application — never get stuck on this
+=== END COVER LETTER ===
 """
 
     job_url = job.get('url', '')
@@ -1668,16 +1837,18 @@ EMAIL VERIFICATION:
 - Enter the code and continue
 
 {resume_instruction}
+{cover_letter_instruction}
 
 STEPS:
 1. Go to the job URL and click Apply/Apply Now
 2. If given option, choose "Apply as Guest" or "Continue without account"
 3. Fill in all required fields using the applicant info above
 4. Upload the resume when prompted
-5. Complete all pages, clicking Continue/Next after each
-6. On voluntary self-identification pages, select "I do not want to answer"
-7. Review and submit the application
-8. Report SUCCESS if you see any confirmation
+5. If there is an option to upload a cover letter or supporting document, upload the cover letter
+6. Complete all pages, clicking Continue/Next after each
+7. On voluntary self-identification pages, select "I do not want to answer"
+8. Review and submit the application
+9. Report SUCCESS if you see any confirmation
 
 When done, say "SUCCESS" if you see any confirmation that the application was submitted/sent/received.
 If the job is unavailable or expired, say "JOB_UNAVAILABLE".
@@ -1701,7 +1872,7 @@ Go to this job posting and apply using Easy Apply: {job_url}
 
 5. URL CHECK: After clicking Apply, call `verify_indeed_easy_apply`. If ABORT, say "EXTERNAL_SITE".
 
-6. STUCK: If same action fails 3 times, call `ask_gemini_for_help`.
+6. STUCK: If same action fails 3 times, call `ask_gemini_for_help`. ALSO: If you notice you have taken many steps (20+) and are not yet on the review/submit page, call `ask_gemini_for_help` proactively to get a shortcut.
 
 7. BLANK PAGE: If page appears empty or stuck loading after clicking Apply, call `check_and_reload_page`. If it says SPA_FAILURE, report failure.
 
@@ -1721,6 +1892,7 @@ APPLICANT:
 - Job: IT Support Specialist at Geek Squad | 5 years experience
 
 {resume_instruction}
+{cover_letter_instruction}
 
 STEPS:
 1. Go to the job URL
@@ -1777,6 +1949,15 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
     else:
         print("Resume: None found")
 
+    # Get cover letter (generated by n8n factory alongside resume)
+    cover_letter_path = get_cover_letter_path(job)
+    if cover_letter_path:
+        print(f"Cover letter: {cover_letter_path}")
+        if _active_logger:
+            _active_logger.cover_letter_available = True
+    else:
+        print("Cover letter: None found")
+
     # Create cloud browser session with persistent profile
     browser_use_api_key = os.getenv("BROWSER_USE_API_KEY")
     os.environ["BROWSER_USE_API_KEY"] = browser_use_api_key
@@ -1805,32 +1986,66 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
             else:
                 raise  # Re-raise non-rate-limit errors
 
-    # Upload resume to cloud
+    # Upload resume and cover letter to cloud
     cloud_resume_name = None
-    if resume_path:
-        cdp_url = browser.browser_profile.cdp_url or ""
-        session_match = re.search(r'wss://([^.]+)\.cdp', cdp_url)
-        if session_match:
-            cloud_session_id = session_match.group(1)
-            print(f"Cloud session: {cloud_session_id}")
+    cloud_cover_letter_name = None
+    cdp_url = browser.browser_profile.cdp_url or ""
+    session_match = re.search(r'wss://([^.]+)\.cdp', cdp_url)
+    cloud_session_id = session_match.group(1) if session_match else None
+    if cloud_session_id:
+        print(f"Cloud session: {cloud_session_id}")
+        if resume_path:
             cloud_resume_name = await upload_file_to_cloud_session(cloud_session_id, resume_path)
+        if cover_letter_path:
+            cloud_cover_letter_name = await upload_file_to_cloud_session(cloud_session_id, cover_letter_path)
 
     file_paths = []
     if cloud_resume_name:
         file_paths.append(cloud_resume_name)
     elif resume_path:
         file_paths.append(resume_path)
+    if cloud_cover_letter_name:
+        file_paths.append(cloud_cover_letter_name)
+    elif cover_letter_path:
+        file_paths.append(cover_letter_path)
 
     agent_resume_path = cloud_resume_name if cloud_resume_name else resume_path
+    agent_cover_letter_path = cloud_cover_letter_name if cloud_cover_letter_name else cover_letter_path
     if cloud_resume_name:
         print(f"Using cloud resume path for agent: {cloud_resume_name}")
-    task = build_task(job, agent_resume_path)
+    if cloud_cover_letter_name:
+        print(f"Using cloud cover letter path for agent: {cloud_cover_letter_name}")
+    task = build_task(job, agent_resume_path, agent_cover_letter_path)
 
     # Create screenshots directory
     screenshots_dir = Path("/root/job_bot/screenshots")
     screenshots_dir.mkdir(exist_ok=True)
     job_id = job.get('id', job.get('application_number', 'unknown'))
     gif_path = str(screenshots_dir / f"{job_company.replace(' ', '_')[:20]}_{job_id}.gif")
+
+    # ============ STEP BUDGETS (ATS-aware) ============
+    # External ATS sites (Greenhouse, Lever) are harder → more steps per phase
+    # Indeed Easy Apply is standardized → tighter budgets
+    if is_external:
+        p1_steps, p2_steps, p3_steps, p4_steps = 50, 15, 10, 10
+    else:
+        p1_steps, p2_steps, p3_steps, p4_steps = 40, 10, 10, 10
+    # De-escalation budget: cheap steps to continue after bu-2-0 breaks through
+    deesc_steps = 15
+
+    # ============ ORCHESTRATOR: Escalation + De-escalation Pipeline ============
+    #
+    # Phase 1: bu-1-0 (p1_steps) — cheap workhorse
+    # Phase 2: bu-1-0 nudge (p2_steps) — same model, fresh prompt ("just needs a nudge")
+    # Phase 3: bu-2-0 Blocker-Buster (p3_steps) — 3x cost, smarter model, short burst
+    #   → 3a: If bu-2-0 made PROGRESS but not done → DE-ESCALATE to bu-1-0 (deesc_steps)
+    #   → 3b: If bu-2-0 still STUCK → escalate to Phase 4
+    # Phase 4: Gemini 3 Pro advisory + bu-2-0 (p4_steps) — last resort
+    #   → 4a: If Gemini+bu-2-0 made PROGRESS → DE-ESCALATE to bu-1-0 (deesc_steps)
+    # Anti-thrashing: bu-1-0 after de-escalation gets ONE chance. If stuck again → fail.
+    #
+    stuck = StuckDetector(window=3)
+    all_agents = []  # Track all agents for history combining
 
     agent = Agent(
         task=task,
@@ -1840,25 +2055,236 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
         available_file_paths=file_paths,
         max_failures=10,
         max_actions_per_step=5,
-        max_steps=40,
+        max_steps=p1_steps,
         generate_gif=gif_path,
     )
     print(f"Recording session to: {gif_path}")
 
     try:
-        print("Starting Browser-Use Cloud agent (v5)...")
-        result = await agent.run()
+        print(f"Starting Browser-Use Cloud agent (bu-1-0, {p1_steps} steps)...")
+        result = await agent.run(on_step_end=stuck.on_step_end)
+        all_agents.append(('bu-1-0:primary', agent))
+
+        # Helper: get last agent and check if done
+        def _latest_done():
+            return all_agents[-1][1].history.is_done()
+
+        # ============ PHASE 2: bu-1-0 nudge ============
+        # Triggers if Phase 1 didn't finish — whether stuck or ran out of steps.
+        # "Sometimes it just needs a little bit of thinking" — cheap retry.
+        if not _latest_done():
+            p1_reason = stuck.trigger_reason if stuck.triggered else f"incomplete@step{agent.state.n_steps}"
+            print(f"  [ORCHESTRATOR] Phase 1 failed ({p1_reason}). Phase 2: bu-1-0 nudge ({p2_steps} steps)...")
+            if _active_logger:
+                _active_logger.stuck_rescued = True
+                _active_logger.rescue_reason = p1_reason
+                _active_logger.log_step(agent.state.n_steps, 'phase1_failed', p1_reason)
+
+            nudge_task = f"""Continue this job application. The browser is already on the correct page.
+The previous attempt failed — analyze the current page state carefully.
+Try these recovery actions: press Escape to close modals, scroll down to reveal hidden elements,
+look for validation errors or unfilled required fields, check for overlays blocking buttons.
+Do NOT re-navigate to the job URL. Fix the immediate blocker and continue.
+
+{task}"""
+
+            stuck_nudge = StuckDetector(window=3)
+            nudge_agent = Agent(
+                task=nudge_task,
+                browser_session=browser,
+                controller=controller,
+                use_vision=True,
+                available_file_paths=file_paths,
+                max_failures=5,
+                max_actions_per_step=5,
+                max_steps=p2_steps,
+            )
+            result = await nudge_agent.run(on_step_end=stuck_nudge.on_step_end)
+            all_agents.append(('bu-1-0:nudge', nudge_agent))
+
+            if _active_logger:
+                _active_logger.log_step(agent.state.n_steps + 1, 'nudge_complete',
+                    f"Done={nudge_agent.history.is_done()}")
+
+        # ============ PHASE 3: bu-2-0 Blocker-Buster (short burst) ============
+        # Only if Phase 2 also failed. bu-2-0 gets a SHORT budget (10 steps) —
+        # just enough to break through the blocker, not to complete the whole form.
+        if not _latest_done():
+            prev = all_agents[-1]
+            p2_reason = "incomplete"
+            print(f"  [ORCHESTRATOR] {prev[0]} failed. Phase 3: bu-2-0 Blocker-Buster ({p3_steps} steps)...")
+            if _active_logger:
+                _active_logger.log_step(agent.state.n_steps + 2, 'escalating_bu2', p2_reason)
+
+            escalation_task = f"""Continue this job application. Previous attempts got stuck on this page.
+The browser is already positioned — do NOT re-navigate.
+Analyze the page screenshot carefully. You need a DIFFERENT approach than what was tried before.
+Try: alternative selectors, scrolling to reveal elements, closing overlays, pressing Escape,
+or different form interaction methods. Focus on getting PAST the current blocker.
+
+{task}"""
+
+            # Snapshot BEFORE bu-2-0 runs (for progress comparison after)
+            pre_bu2_state = await snapshot_browser_state(browser)
+            print(f"  [SNAPSHOT] Pre-bu-2-0: {pre_bu2_state['path']} ({pre_bu2_state['input_count']} inputs)")
+
+            stuck_t3 = StuckDetector(window=3)
+            bu2_agent = Agent(
+                task=escalation_task,
+                llm=ChatBrowserUse(model='bu-2-0'),  # Explicit: 3x cost, 83.3% accuracy
+                browser_session=browser,
+                controller=controller,
+                use_vision=True,
+                available_file_paths=file_paths,
+                max_failures=5,
+                max_actions_per_step=5,
+                max_steps=p3_steps,
+            )
+            result = await bu2_agent.run(on_step_end=stuck_t3.on_step_end)
+            all_agents.append(('bu-2-0:blocker_buster', bu2_agent))
+
+            # ===== DE-ESCALATION CHECK after bu-2-0 =====
+            # Uses state snapshot comparison (URL path + DOM element flux)
+            # If bu-2-0 made REAL progress → de-escalate to bu-1-0 (cheap)
+            # If bu-2-0 IS stuck or no progress → escalate to Phase 4 (Gemini)
+            if not bu2_agent.history.is_done() and not stuck_t3.triggered:
+                post_bu2_state = await snapshot_browser_state(browser)
+                progress = detect_progress(pre_bu2_state, post_bu2_state)
+                print(f"  [SNAPSHOT] Post-bu-2-0: {post_bu2_state['path']} ({post_bu2_state['input_count']} inputs) → progress={progress}")
+
+                if progress:
+                    print(f"  [ORCHESTRATOR] bu-2-0 broke through blocker. DE-ESCALATING to bu-1-0 ({deesc_steps} steps)...")
+                    if _active_logger:
+                        _active_logger.log_step(agent.state.n_steps + 3, 'de_escalate', 'bu2_progress_detected')
+
+                    deesc_task = f"""Continue this job application. The browser is on the correct page.
+A previous agent got past the hard part — now complete the remaining form pages.
+Do NOT re-navigate. Fill fields, click Continue/Next, and submit.
+
+{task}"""
+
+                    stuck_deesc = StuckDetector(window=3)
+                    deesc_agent = Agent(
+                        task=deesc_task,
+                        # No llm= → defaults to bu-1-0 (cheap, $0.005/step)
+                        browser_session=browser,
+                        controller=controller,
+                        use_vision=True,
+                        available_file_paths=file_paths,
+                        max_failures=5,
+                        max_actions_per_step=5,
+                        max_steps=deesc_steps,
+                    )
+                    result = await deesc_agent.run(on_step_end=stuck_deesc.on_step_end)
+                    all_agents.append(('bu-1-0:deesc_after_bu2', deesc_agent))
+
+                    # Anti-thrashing: if bu-1-0 gets stuck AGAIN, go straight to Gemini
+                    if not deesc_agent.history.is_done() and stuck_deesc.triggered:
+                        print(f"  [ORCHESTRATOR] De-escalated bu-1-0 stuck again ({stuck_deesc.trigger_reason}). → Gemini")
+                        if _active_logger:
+                            _active_logger.log_step(agent.state.n_steps + 4, 'deesc_stuck', stuck_deesc.trigger_reason)
+                        # Fall through to Phase 4 below
+                else:
+                    # No progress detected — bu-2-0 used all steps without getting stuck
+                    # but also didn't change the page. Treat as stuck → Phase 4.
+                    print(f"  [ORCHESTRATOR] bu-2-0 no progress detected (same page state). → Phase 4")
+
+        # ============ PHASE 4: Gemini 3 Pro advisory + bu-2-0 final attempt ============
+        # Last resort — only triggered if:
+        #   (a) bu-2-0 was stuck (no progress), OR
+        #   (b) de-escalated bu-1-0 got stuck again (anti-thrashing escalation)
+        # Cost: ~$0.03 Gemini + ~$0.01 bu-2-0 = ~$0.04
+        if not _latest_done() and len(all_agents) >= 3:  # At least primary+nudge+bu2 ran
+            latest_name, latest_ag = all_agents[-1]
+            # Only run Gemini if the latest agent was actually stuck (not just incomplete)
+            latest_stuck = any(
+                n in latest_name for n in ['bu-2-0', 'deesc']
+            )
+            if latest_stuck:
+                print(f"  [ORCHESTRATOR] Phase 4: Gemini 3 Pro advisory + bu-2-0 ({p4_steps} steps)...")
+                if _active_logger:
+                    _active_logger.log_step(agent.state.n_steps + 5, 'gemini_advisory', latest_name)
+
+                # Snapshot BEFORE Gemini+bu-2-0 intervention
+                pre_gemini_state = await snapshot_browser_state(browser)
+
+                rescue_advice = await gemini_rescue_analysis(browser, task[:200], attempt=2)
+
+                final_task = f"""Continue this job application. Multiple previous attempts have failed.
+
+EXPERT ANALYSIS (follow this advice):
+{rescue_advice}
+
+The browser is on the correct page. Fix the issue described above and complete the application.
+
+{task}"""
+
+                gemini_bu2_agent = Agent(
+                    task=final_task,
+                    llm=ChatBrowserUse(model='bu-2-0'),  # Explicit: expensive model with Gemini guidance
+                    browser_session=browser,
+                    controller=controller,
+                    use_vision=True,
+                    available_file_paths=file_paths,
+                    max_failures=3,
+                    max_actions_per_step=5,
+                    max_steps=p4_steps,
+                )
+                result = await gemini_bu2_agent.run()
+                all_agents.append(('bu-2-0:gemini_guided', gemini_bu2_agent))
+
+                # ===== DE-ESCALATION after Gemini+bu-2-0 =====
+                # Uses snapshot comparison: if Gemini+bu-2-0 made real progress → bu-1-0 to finish
+                if not gemini_bu2_agent.history.is_done():
+                    post_gemini_state = await snapshot_browser_state(browser)
+                    gemini_progress = detect_progress(pre_gemini_state, post_gemini_state)
+                    print(f"  [SNAPSHOT] Post-Gemini: {post_gemini_state['path']} → progress={gemini_progress}")
+
+                    if gemini_progress:
+                        print(f"  [ORCHESTRATOR] Gemini+bu-2-0 broke through. Final de-escalation to bu-1-0 ({deesc_steps} steps)...")
+                        stuck_final = StuckDetector(window=3)
+                        final_deesc = Agent(
+                            task=f"""Continue this job application. An expert analyzed the page and the agent broke through.
+Complete the remaining steps. Do NOT re-navigate.
+
+{task}""",
+                            # No llm= → defaults to bu-1-0 (cheap, $0.005/step)
+                            browser_session=browser,
+                            controller=controller,
+                            use_vision=True,
+                            available_file_paths=file_paths,
+                            max_failures=3,
+                            max_actions_per_step=5,
+                            max_steps=deesc_steps,
+                        )
+                        result = await final_deesc.run(on_step_end=stuck_final.on_step_end)
+                        all_agents.append(('bu-1-0:final_deesc', final_deesc))
+
+        # Log pipeline completion
+        if _active_logger and len(all_agents) > 1:
+            final_agent = all_agents[-1][1]
+            phase_names = [name for name, _ in all_agents]
+            _active_logger.log_step(agent.state.n_steps + 6, 'pipeline_complete',
+                f"Phases: {' → '.join(phase_names)}. Done={final_agent.history.is_done()}")
 
         final_content = ""
+        result_str = str(result)
 
-        # Extract step history from agent result
+        # Extract step history from all agents (primary + nudge + rescue if applicable)
         # Note: step.metadata.step_start_time is often 0 in Browser-Use Cloud,
         # so we distribute timestamps proportionally between session start/end
         total_steps = 0
+        primary_steps = len(agent.history.history) if agent.history else 0
+        rescue_steps = 0
         try:
             all_history = []
-            if hasattr(result, 'history') and result.history:
-                all_history = list(result.history())
+            # Combine history from all agents in the pipeline
+            for ag_name, ag in all_agents:
+                if ag.history and ag.history.history:
+                    ag_steps = len(ag.history.history)
+                    all_history.extend(ag.history.history)
+                    if ag_name != 'bu-1-0:primary':
+                        rescue_steps += ag_steps
 
             # Calculate proportional timestamps
             session_start = _active_logger.start_time if _active_logger else datetime.now()
@@ -1896,17 +2322,20 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
 
         # Extract final result if not found from history API
         if not final_content:
-            result_str = str(result)
             done_pattern = r"is_done=True.*?extracted_content=['\"](.+?)['\"]"
             matches = re.findall(done_pattern, result_str, re.DOTALL)
             if matches:
                 final_content = matches[-1]
             else:
+                # Try quoted content first, then unquoted fallback
                 status_match = re.search(r"extracted_content=['\"]([^'\"]+)['\"]", result_str)
+                if not status_match:
+                    status_match = re.search(r"extracted_content=([^,)\]\s]{5,200})", result_str)
                 if status_match:
                     final_content = status_match.group(1)
 
-        print(f"Result: {final_content or 'No clear status found'}")
+        step_breakdown = f"{primary_steps}+{rescue_steps}" if rescue_steps else str(total_steps)
+        print(f"Result: {final_content or 'No clear status found'} (steps: {step_breakdown})")
 
         # Helper to save log and return
         def _finish(success: bool, reason: str) -> tuple[bool, str]:
@@ -1963,7 +2392,30 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
         if final_content:
             return _finish(False, final_content[:200])
         else:
-            return _finish(False, "incomplete")
+            # Categorize failure type based on how far through the pipeline we got
+            phase_names = [n for n, _ in all_agents]
+            phases_str = ' → '.join(phase_names)
+            if len(all_agents) >= 4:
+                reason = "stuck_full_pipeline_failed"
+                print(f"  [DEBUG] Full pipeline exhausted: {phases_str} ({total_steps} total steps)")
+            elif any('bu-2-0' in n for n, _ in all_agents):
+                reason = "stuck_rescue_failed"
+                print(f"  [DEBUG] Rescue pipeline failed: {phases_str} ({rescue_steps} rescue steps)")
+            elif any('nudge' in n for n, _ in all_agents):
+                reason = "stuck_nudge_failed"
+                print(f"  [DEBUG] Nudge failed, bu-2-0 not reached: {phases_str}")
+            elif stuck.triggered:
+                reason = "stuck_no_rescue"
+                print(f"  [DEBUG] Stuck at step {stuck.trigger_step}")
+            elif total_steps >= p1_steps - 5:
+                reason = "step_limit_exceeded"
+                print(f"  [DEBUG] Exhausted {total_steps}/{p1_steps} steps")
+            else:
+                reason = "incomplete"
+                print(f"  [DEBUG] Incomplete after {total_steps} steps. Raw result tail: {result_str[-300:]}")
+            if _active_logger:
+                _active_logger.log_step(total_steps, 'incomplete_debug', result_str[-500:])
+            return _finish(False, reason)
 
     except Exception as e:
         print(f"Error: {e}")

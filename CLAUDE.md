@@ -21,7 +21,10 @@ Queue System (queue/pending.json)
 Browser-Use Cloud (bot/applier.py)
   ├── Form injection (JS-based, React-aware)
   ├── CAPTCHA solving (CapSolver: hCaptcha, Turnstile, reCAPTCHA)
-  ├── Gemini Rescue: Tier 1 = 2.5 Flash, Tier 2 = Gemini 3 Pro (4K thinking)
+  ├── Cover letter upload (optional, from n8n factory)
+  ├── Escalation: bu-1-0 → bu-1-0 nudge → bu-2-0 Blocker-Buster → Gemini 3 Pro + bu-2-0
+  ├── De-escalation: bu-2-0 breaks blocker → bu-1-0 finishes cheaply
+  ├── Stuck detection: URL+action fingerprinting via on_step_end hook
   └── Success detection (URL + text + confidence scoring)
     ↓
 Indeed Easy Apply + External ATS (with guest apply)
@@ -34,7 +37,7 @@ Indeed Easy Apply + External ATS (with guest apply)
 | `agent/simple_hunter.py` | JobSpy scraper + Gemini 2.5 Flash scoring, sends to n8n |
 | `agent/scorer.py` | Gemini 2.5 Flash job fit scoring engine |
 | `agent/candidate_profile.py` | Full candidate profile (497 lines) |
-| `bot/applier.py` | Main applier - Browser-Use Cloud + Gemini rescue (1620+ lines) |
+| `bot/applier.py` | Main applier - Browser-Use Cloud + escalation/de-escalation pipeline (2500+ lines) |
 | `bot/utils.py` | Stuck detection, cookie health, success detection |
 | `bot/email_helper.py` | Gmail/Outlook verification code extraction |
 | `config.py` | Central config (paths, applicant info, model tiers) |
@@ -52,9 +55,9 @@ Indeed Easy Apply + External ATS (with guest apply)
 |---------|-------|----------|
 | Job Scoring | Gemini 2.5 Flash | Google AI |
 | Resume/Cover Letter Gen | Gemini 3 Pro | Google AI (via n8n) |
-| Browser Agent (primary) | Browser-Use Cloud | Browser-Use |
-| Rescue Tier 1 (fast) | Gemini 2.5 Flash | Google AI |
-| Rescue Tier 2 (deep) | Gemini 3 Pro Preview (4K thinking) | Google AI |
+| Browser Agent (primary) | bu-1-0 (74.7% accuracy) | Browser-Use Cloud |
+| Browser Agent (rescue) | bu-2-0 (83.3% accuracy, 3x cost) | Browser-Use Cloud |
+| Rescue Advisory (last resort) | Gemini 3 Pro Preview (4K thinking) | Google AI |
 | Fallback (config.py tiers) | DeepSeek V3, Claude Sonnet | OpenRouter |
 
 ## How to Run
@@ -119,7 +122,27 @@ Edit `bot/applier.py` APPLICANT dict or `config.py` to change.
 - Skips if login required -> records as `needs_login`
 - Skips if external redirect to blocked ATS -> records as `external_site`
 - CAPTCHA auto-solved via CapSolver (hCaptcha, Turnstile, reCAPTCHA v2)
-- Gemini rescue triggered after 3 consecutive identical failed actions
+- Cover letter uploaded as supporting document when available (low priority)
+
+## Escalation + De-escalation Pipeline
+
+```
+Phase 1: bu-1-0 (40 steps Indeed / 50 steps External)
+    ↓ not done?
+Phase 2: bu-1-0 nudge (10/15 steps, fresh prompt)
+    ↓ still not done?
+Phase 3: bu-2-0 Blocker-Buster (10 steps, 3x cost)
+    ├── PROGRESS → DE-ESCALATE to bu-1-0 (15 steps)
+    │   └── stuck again? → Phase 4 (no ping-pong)
+    └── STUCK → Phase 4
+Phase 4: Gemini 3 Pro advisory + bu-2-0 (10 steps)
+    └── PROGRESS → DE-ESCALATE to bu-1-0 (15 steps)
+```
+
+- Stuck detection: URL+action fingerprinting via on_step_end hook (window=3)
+- De-escalation trigger: bu-2-0 not stuck AND not done → hand back to bu-1-0
+- Anti-thrashing: bu-1-0 after de-escalation gets ONE chance
+- Expected cost: ~$0.02/app average, ~$0.08 worst case
 
 ## Rate Limiting
 
@@ -127,10 +150,9 @@ Edit `bot/applier.py` APPLICANT dict or `config.py` to change.
 
 ## Browser-Use Cloud
 
-- Uses Browser-Use 1.0 cloud browser (no local Chrome needed)
+- Uses Browser-Use Cloud (no local Chrome needed)
+- Models: bu-1-0 ($0.003-0.008/step), bu-2-0 ($0.01-0.025/step)
 - Automatic US residential proxy
 - Vision-enabled for screenshot analysis
-- Max 50 steps per application
 - GIF recording of sessions
-- $0.005 per task (~200 tasks per $1)
 - Dashboard: https://browser-use.com
