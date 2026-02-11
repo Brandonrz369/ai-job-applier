@@ -528,12 +528,12 @@ async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
         _captcha_attempt_count[url_key] = _captcha_attempt_count.get(url_key, 0) + 1
         attempt = _captcha_attempt_count[url_key]
 
-        if attempt > 2:
+        if attempt > 3:
             print(f"  [CapSolver] CAPTCHA attempt {attempt} - session tainted, giving up")
             if _active_logger:
                 _active_logger.log_captcha("unknown", attempt, False)
             return ActionResult(
-                extracted_content="CAPTCHA_FAILED: Max 2 attempts reached. Session is tainted by anti-bot. "
+                extracted_content="CAPTCHA_FAILED: Max 3 attempts reached. Session is tainted by anti-bot. "
                 "Stop trying to solve and report failure. Say 'CAPTCHA_BLOCKED' and use done action."
             )
         captcha_solve_start = time.time()
@@ -583,25 +583,55 @@ async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
                     if site_key:
                         captcha_type = "AntiTurnstileTaskProxyLess"
 
-            # Check for reCAPTCHA v2
+            # Check for reCAPTCHA v2 (auto-detect Enterprise vs Standard)
+            enterprise_payload = None
             if not captcha_type:
                 recaptcha_elements = await page.get_elements_by_css_selector('.g-recaptcha, [data-sitekey], iframe[src*="recaptcha"]')
                 if recaptcha_elements:
-                    print(f"  [CapSolver] reCAPTCHA detected on {page_url[:50]}...")
-                    site_key = await page.evaluate("""
+                    # Single evaluate to detect key + Enterprise flag + data-s parameter
+                    recaptcha_info = await page.evaluate("""
                         () => {
-                            const el = document.querySelector('.g-recaptcha, [data-sitekey]');
-                            if (el) return el.getAttribute('data-sitekey');
-                            const iframe = document.querySelector('iframe[src*="recaptcha"]');
-                            if (iframe) {
-                                const match = iframe.src.match(/[?&]k=([^&]+)/);
-                                return match ? match[1] : null;
+                            let key = null;
+                            let dataS = null;
+                            // Check for Enterprise: grecaptcha.enterprise exists
+                            const isEnterprise = !!(window.grecaptcha && window.grecaptcha.enterprise);
+                            // Also check iframe URL for /enterprise/ path
+                            const iframes = document.querySelectorAll('iframe[src*="recaptcha"]');
+                            let iframeEnterprise = false;
+                            for (const iframe of iframes) {
+                                if (iframe.src.includes('/enterprise/')) iframeEnterprise = true;
+                                if (!key) {
+                                    const match = iframe.src.match(/[?&]k=([^&]+)/);
+                                    if (match) key = match[1];
+                                }
                             }
-                            return null;
+                            // Check DOM element for sitekey and data-s
+                            const el = document.querySelector('.g-recaptcha, [data-sitekey]');
+                            if (el) {
+                                if (!key) key = el.getAttribute('data-sitekey');
+                                dataS = el.getAttribute('data-s') || null;
+                            }
+                            return {
+                                key: key,
+                                isEnterprise: isEnterprise || iframeEnterprise,
+                                dataS: dataS
+                            };
                         }
                     """)
+                    site_key = recaptcha_info.get('key') if isinstance(recaptcha_info, dict) else None
+                    is_enterprise = recaptcha_info.get('isEnterprise', False) if isinstance(recaptcha_info, dict) else False
+                    data_s = recaptcha_info.get('dataS') if isinstance(recaptcha_info, dict) else None
+
                     if site_key:
-                        captcha_type = "ReCaptchaV2TaskProxyLess"
+                        if is_enterprise:
+                            captcha_type = "ReCaptchaV2EnterpriseTaskProxyLess"
+                            print(f"  [CapSolver] reCAPTCHA ENTERPRISE detected on {page_url[:50]}...")
+                            if data_s:
+                                enterprise_payload = {"s": data_s}
+                                print(f"  [CapSolver] Found data-s parameter ({len(data_s)} chars)")
+                        else:
+                            captcha_type = "ReCaptchaV2TaskProxyLess"
+                            print(f"  [CapSolver] reCAPTCHA v2 (standard) detected on {page_url[:50]}...")
 
             if not captcha_type or not site_key:
                 return ActionResult(extracted_content="No supported CAPTCHA found or sitekey missing")
@@ -619,6 +649,9 @@ async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
             }
             if browser_ua:
                 task_payload["userAgent"] = browser_ua
+            # Enterprise: pass data-s and action payload if detected
+            if enterprise_payload and "Enterprise" in (captcha_type or ""):
+                task_payload["enterprisePayload"] = enterprise_payload
 
             payload = {
                 "clientKey": CAPSOLVER_API_KEY,
@@ -633,10 +666,12 @@ async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
 
             print(f"  [CapSolver] Task created: {task_id}")
 
-            # ============ 3. Poll for Result (async) ============
+            # ============ 3. Poll for Result (async, 3s interval) ============
             solution = None
-            for i in range(24):  # 120 seconds max
-                await asyncio.sleep(5)
+            poll_interval = 3  # Faster polling — Enterprise solves take 10-30s
+            max_polls = 40  # 40 * 3s = 120 seconds max
+            for i in range(max_polls):
+                await asyncio.sleep(poll_interval)
                 async with http_client.post("https://api.capsolver.com/getTaskResult",
                                            json={"clientKey": CAPSOLVER_API_KEY, "taskId": task_id},
                                            timeout=aiohttp.ClientTimeout(total=30)) as resp:
@@ -647,9 +682,12 @@ async def solve_captcha(browser_session: BrowserSession) -> ActionResult:
                                    result.get("solution", {}).get("token")
                         break
                     elif result.get("status") == "failed":
-                        return ActionResult(extracted_content=f"Solving failed: {result.get('errorDescription')}")
+                        error_desc = result.get('errorDescription', 'unknown')
+                        error_id = result.get('errorId', '')
+                        print(f"  [CapSolver] Solve failed: {error_desc} (errorId={error_id})")
+                        return ActionResult(extracted_content=f"Solving failed: {error_desc}")
 
-                    print(f"  [CapSolver] Waiting... ({i*5}s)")
+                    print(f"  [CapSolver] Waiting... ({i*poll_interval}s)")
 
             if not solution:
                 return ActionResult(extracted_content="Timeout waiting for CAPTCHA solution")
@@ -2108,7 +2146,7 @@ Go to this job posting and apply using Easy Apply: {job_url}
 
 3. VALIDATION: Call `check_validation_errors` before clicking Continue/Next/Submit.
 
-4. CAPTCHA: Call `solve_captcha` for any CAPTCHA. Max 2 attempts. If CAPTCHA_FAILED, report failure.
+4. CAPTCHA: Call `solve_captcha` for any CAPTCHA. Max 3 attempts. If CAPTCHA_FAILED, report failure.
 
 5. URL CHECK: After clicking Apply, call `verify_indeed_easy_apply`. If ABORT, say "EXTERNAL_SITE".
 
