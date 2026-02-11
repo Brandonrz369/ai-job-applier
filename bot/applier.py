@@ -1175,38 +1175,165 @@ async def check_validation_errors(browser_session: BrowserSession) -> ActionResu
 # After bu-2-0 runs, compare snapshot to detect real progress.
 
 async def snapshot_browser_state(browser) -> dict:
-    """Capture lightweight browser state for progress comparison."""
+    """Capture rich browser state for progress comparison and context distillation.
+
+    Signals captured:
+    - URL path + hash fragment (catches SPA navigation via #step2, #review)
+    - Page title (changes on navigation, useful for handoff context)
+    - Input/select/textarea count (total interactive fields)
+    - Filled field count + fill percentage (form progress tracking)
+    - Visible button texts (identifies review/submit pages)
+    - Visible error messages (helps de-escalation handoff)
+    """
+    empty = {'url': '', 'path': '', 'hash': '', 'title': '',
+             'input_count': 0, 'filled_count': 0, 'fill_pct': 0,
+             'button_texts': '', 'errors': '', 'is_review_page': False}
     try:
         page = await browser.get_current_page()
         if not page:
-            return {'url': '', 'path': '', 'input_count': 0, 'button_texts': ''}
-        url = await page.evaluate("() => window.location.href")
-        input_count = await page.evaluate("() => document.querySelectorAll('input, select, textarea').length")
-        button_texts = await page.evaluate("""() => {
-            return Array.from(document.querySelectorAll('button, input[type="submit"]'))
+            return empty
+
+        # Single evaluate call for all DOM signals (reduces round-trips)
+        state = await page.evaluate("""() => {
+            const inputs = document.querySelectorAll('input:not([type="hidden"]), select, textarea');
+            let total = 0, filled = 0;
+            inputs.forEach(f => {
+                if (f.offsetParent !== null) {
+                    total++;
+                    if (f.value && f.value.trim().length > 0) filled++;
+                }
+            });
+
+            const buttons = Array.from(document.querySelectorAll('button, input[type="submit"], a[role="button"]'))
                 .filter(b => b.offsetParent !== null)
-                .map(b => b.innerText.trim().substring(0, 20))
-                .slice(0, 8).join('|');
+                .map(b => b.innerText.trim().substring(0, 30))
+                .slice(0, 10);
+
+            const errors = Array.from(document.querySelectorAll('.error, .invalid, [class*="error"], [aria-invalid="true"], [role="alert"]'))
+                .filter(el => el.offsetParent !== null && el.innerText.trim().length > 3 && el.innerText.trim().length < 200)
+                .map(el => el.innerText.trim())
+                .slice(0, 5);
+
+            const reviewKeywords = ['review', 'submit', 'confirm', 'summary', 'finish'];
+            const btnTexts = buttons.map(b => b.toLowerCase());
+            const titleLower = document.title.toLowerCase();
+            const isReview = reviewKeywords.some(k => btnTexts.some(b => b.includes(k)) || titleLower.includes(k));
+
+            return {
+                url: window.location.href,
+                hash: window.location.hash,
+                title: document.title.substring(0, 100),
+                input_count: total,
+                filled_count: filled,
+                button_texts: buttons.join('|'),
+                errors: errors.join(' | '),
+                is_review_page: isReview
+            };
         }""")
+
         from urllib.parse import urlparse
+        url = state.get('url', '')
         path = urlparse(url).path if url else ''
-        return {'url': url, 'path': path, 'input_count': input_count, 'button_texts': button_texts}
+        total = state.get('input_count', 0)
+        filled = state.get('filled_count', 0)
+        fill_pct = round(filled / total * 100) if total > 0 else 0
+
+        return {
+            'url': url,
+            'path': path,
+            'hash': state.get('hash', ''),
+            'title': state.get('title', ''),
+            'input_count': total,
+            'filled_count': filled,
+            'fill_pct': fill_pct,
+            'button_texts': state.get('button_texts', ''),
+            'errors': state.get('errors', ''),
+            'is_review_page': state.get('is_review_page', False),
+        }
     except Exception:
-        return {'url': '', 'path': '', 'input_count': 0, 'button_texts': ''}
+        return empty
 
 
 def detect_progress(before: dict, after: dict) -> bool:
-    """Compare two browser state snapshots. Returns True if real progress was made."""
-    # Gold Standard: URL path changed (navigated to new page)
+    """Compare two browser state snapshots. Returns True if real progress was made.
+
+    Checks (in priority order):
+    1. URL path changed → definite navigation
+    2. Hash fragment changed → SPA navigation (#step1 → #step2)
+    3. Page title changed → SPA or redirect
+    4. Form fill % increased significantly → fields being completed
+    5. Input count or button texts changed → different form page
+    """
+    # 1. Gold Standard: URL path changed (navigated to new page)
     if before['path'] and after['path'] and before['path'] != after['path']:
         return True
-    # SPA fallback: same URL but different interactive elements (form page changed)
-    if before['path'] == after['path'] and before['input_count'] > 0:
-        input_delta = abs(after['input_count'] - before['input_count'])
-        buttons_changed = before['button_texts'] != after['button_texts']
+
+    # 2. SPA hash navigation (#step1 → #review, etc.)
+    if before.get('hash', '') != after.get('hash', '') and after.get('hash', ''):
+        return True
+
+    # 3. Page title changed (common in SPAs and multi-step wizards)
+    if before.get('title', '') and after.get('title', '') and before['title'] != after['title']:
+        return True
+
+    # 4. Form fill percentage jumped (fields being completed)
+    fill_delta = after.get('fill_pct', 0) - before.get('fill_pct', 0)
+    if fill_delta >= 15:  # 15%+ more fields filled = real progress
+        return True
+
+    # 5. DOM structure changed (different form page, same URL)
+    if before['path'] == after['path'] and before.get('input_count', 0) > 0:
+        input_delta = abs(after.get('input_count', 0) - before.get('input_count', 0))
+        buttons_changed = before.get('button_texts', '') != after.get('button_texts', '')
         if input_delta >= 2 or buttons_changed:
             return True
+
     return False
+
+
+def build_handoff_context(before: dict, after: dict, phase_from: str) -> str:
+    """Build a structured context distillation prompt for de-escalation handoff.
+
+    Instead of generic "previous agent got past the hard part", this gives the
+    cheap model specific information about what changed and what to do next.
+    """
+    parts = []
+
+    # What changed
+    if before['path'] != after['path']:
+        parts.append(f"NAVIGATED: {before['path']} → {after['path']}")
+    elif before.get('hash', '') != after.get('hash', ''):
+        parts.append(f"SPA NAVIGATION: {before.get('hash', '')} → {after.get('hash', '')}")
+    elif before.get('title', '') != after.get('title', ''):
+        parts.append(f"PAGE CHANGED: '{before.get('title', '')}' → '{after.get('title', '')}'")
+
+    # Current form state
+    if after.get('input_count', 0) > 0:
+        parts.append(f"FORM STATE: {after.get('filled_count', 0)}/{after['input_count']} fields filled ({after.get('fill_pct', 0)}%)")
+
+    # Available actions
+    if after.get('button_texts', ''):
+        parts.append(f"VISIBLE BUTTONS: {after['button_texts']}")
+
+    # Errors to fix
+    if after.get('errors', ''):
+        parts.append(f"ERRORS ON PAGE: {after['errors']}")
+
+    # Review page hint
+    if after.get('is_review_page', False):
+        parts.append("NEAR COMPLETION: This looks like a review/submit page. Just verify and submit.")
+
+    # Current URL for orientation
+    parts.append(f"CURRENT URL: {after.get('url', 'unknown')}")
+
+    context = "\n".join(parts)
+    return f"""HANDOFF FROM {phase_from}:
+The previous agent broke through a blocker. Here is the current state:
+
+{context}
+
+Continue from this exact state. Do NOT re-navigate to the job URL.
+Fill any remaining empty fields, fix any errors shown above, and click the next action button."""
 
 
 # ============ STUCK DETECTOR (Programmatic) ============
@@ -1258,8 +1385,19 @@ class StuckDetector:
             agent.state.stopped = True  # Graceful stop — run() loop will break
 
 
-async def gemini_rescue_analysis(browser, task_summary: str, attempt: int = 1) -> str:
-    """Standalone Gemini 3 Pro rescue — called by orchestrator, not by agent."""
+async def gemini_rescue_analysis(browser, task_summary: str, attempt: int = 1,
+                                  agent_history: list = None) -> str:
+    """Standalone Gemini 3 Pro rescue with full page context + agent history.
+
+    Provides Gemini with:
+    - Full interactive DOM tree (forms, inputs, buttons, selects with their states)
+    - Visible error messages and validation states
+    - Iframe content (Indeed Easy Apply uses iframes)
+    - Agent action history (what was tried and failed)
+    - Page URL and title
+    This is much richer than a screenshot which can miss hidden elements, disabled
+    states, iframe content, and aria attributes.
+    """
     if not GEMINI_AVAILABLE or not GEMINI_API_KEY:
         return "Gemini not available"
 
@@ -1269,36 +1407,138 @@ async def gemini_rescue_analysis(browser, task_summary: str, attempt: int = 1) -
             return "Could not get page for analysis"
 
         current_url = await page.evaluate("() => window.location.href")
-        visible_text = await page.evaluate("() => document.body.innerText.substring(0, 1500)")
-        error_messages = await page.evaluate("""() => {
+
+        # Full interactive element tree — much richer than a screenshot
+        dom_context = await page.evaluate("""() => {
+            function describeElement(el) {
+                const tag = el.tagName.toLowerCase();
+                const type = el.getAttribute('type') || '';
+                const name = el.getAttribute('name') || '';
+                const id = el.id || '';
+                const label = el.getAttribute('aria-label') || el.getAttribute('placeholder') || '';
+                const value = el.value || '';
+                const required = el.hasAttribute('required') || el.getAttribute('aria-required') === 'true';
+                const disabled = el.disabled;
+                const hidden = el.offsetParent === null;
+                const invalid = el.getAttribute('aria-invalid') === 'true';
+
+                let desc = `<${tag}`;
+                if (type) desc += ` type="${type}"`;
+                if (name) desc += ` name="${name}"`;
+                if (id) desc += ` id="${id}"`;
+                if (label) desc += ` label="${label}"`;
+                if (required) desc += ' REQUIRED';
+                if (disabled) desc += ' DISABLED';
+                if (hidden) desc += ' HIDDEN';
+                if (invalid) desc += ' INVALID';
+                if (value) desc += ` value="${value.substring(0, 50)}"`;
+
+                if (tag === 'select') {
+                    const opts = Array.from(el.options).slice(0, 8).map(o =>
+                        `${o.selected ? '*' : ''}${o.text.substring(0, 30)}`
+                    );
+                    desc += ` options=[${opts.join(', ')}]`;
+                }
+                desc += '>';
+                return desc;
+            }
+
+            const parts = [];
+
+            // All interactive elements
+            const interactives = document.querySelectorAll(
+                'input:not([type="hidden"]), select, textarea, button, a[role="button"], input[type="submit"]'
+            );
+            parts.push('=== INTERACTIVE ELEMENTS ===');
+            interactives.forEach((el, i) => {
+                if (i < 40) parts.push(describeElement(el));
+            });
+
+            // Error messages
             const errors = [];
-            document.querySelectorAll('.error, .invalid, [class*="error"], [aria-invalid="true"]').forEach(el => {
+            document.querySelectorAll(
+                '.error, .invalid, [class*="error"], [class*="Error"], [aria-invalid="true"], [role="alert"], .field-error, .validation-error'
+            ).forEach(el => {
                 const t = el.innerText.trim();
-                if (t && t.length < 200 && el.offsetParent !== null) errors.push(t);
+                if (t && t.length > 3 && t.length < 200 && el.offsetParent !== null) errors.push(t);
             });
-            return errors.slice(0, 5).join(' | ');
-        }""")
-        buttons = await page.evaluate("""() => {
-            const btns = [];
-            document.querySelectorAll('button, input[type="submit"], a[role="button"]').forEach((b, i) => {
-                if (b.offsetParent !== null && i < 10) btns.push(b.innerText.trim().substring(0, 30));
+            if (errors.length) {
+                parts.push('\\n=== ERRORS ON PAGE ===');
+                errors.slice(0, 8).forEach(e => parts.push('ERROR: ' + e));
+            }
+
+            // Modal/overlay detection
+            const modals = document.querySelectorAll('[role="dialog"], .modal, [class*="modal"], [class*="overlay"]');
+            const visibleModals = Array.from(modals).filter(m => m.offsetParent !== null);
+            if (visibleModals.length) {
+                parts.push('\\n=== ACTIVE MODALS/OVERLAYS ===');
+                visibleModals.forEach(m => {
+                    parts.push(`Modal: ${m.className.substring(0, 60)} text="${m.innerText.substring(0, 100)}"`);
+                });
+            }
+
+            // Check iframes (Indeed Easy Apply uses iframes)
+            const iframes = document.querySelectorAll('iframe');
+            iframes.forEach((frame, idx) => {
+                try {
+                    const frameDoc = frame.contentDocument || frame.contentWindow.document;
+                    if (frameDoc) {
+                        const frameInputs = frameDoc.querySelectorAll('input:not([type="hidden"]), select, textarea, button');
+                        if (frameInputs.length > 0) {
+                            parts.push(`\\n=== IFRAME ${idx} (${frame.src ? frame.src.substring(0, 60) : 'no-src'}) ===`);
+                            frameInputs.forEach((el, i) => {
+                                if (i < 20) parts.push(describeElement(el));
+                            });
+                        }
+                    }
+                } catch(e) { /* cross-origin */ }
             });
-            return btns.join(', ');
+
+            // Page title + heading
+            parts.push('\\n=== PAGE INFO ===');
+            parts.push('Title: ' + document.title);
+            const h1 = document.querySelector('h1');
+            if (h1) parts.push('H1: ' + h1.innerText.substring(0, 100));
+
+            return parts.join('\\n');
         }""")
+
+        # Agent action history — what was tried and failed
+        history_summary = ""
+        if agent_history:
+            history_lines = []
+            for i, step in enumerate(agent_history[-10:]):  # Last 10 steps
+                try:
+                    url = step.state.url[:60] if step.state else "?"
+                    actions = str(step.model_output.action)[:100] if (step.model_output and step.model_output.action) else "none"
+                    errors = ""
+                    for r in (step.result or []):
+                        if r.error:
+                            errors = f" ERROR: {str(r.error)[:80]}"
+                    history_lines.append(f"Step {i+1}: {actions}{errors} @ {url}")
+                except Exception:
+                    pass
+            if history_lines:
+                history_summary = "\n=== AGENT HISTORY (last 10 steps — what was tried) ===\n" + "\n".join(history_lines)
 
         client = genai.Client(api_key=GEMINI_API_KEY)
         thinking_budget = 2048 if attempt == 1 else 4096
-        print(f"  [RESCUE ANALYSIS] Gemini 3 Pro ({thinking_budget} thinking)")
+        print(f"  [RESCUE ANALYSIS] Gemini 3 Pro ({thinking_budget} thinking, {len(dom_context)} chars DOM)")
 
         prompt = f"""Browser automation agent is STUCK applying for a job.
+
 URL: {current_url}
 Task: {task_summary}
-Errors: {error_messages or 'None visible'}
-Buttons: {buttons or 'None found'}
-Page text: {visible_text[:1000]}
 
-{"What ONE action unblocks this?" if attempt == 1 else "DEEP ANALYZE: Why is the form stuck? Consider hidden validation, React hydration, modal overlays, wrong element."}
-Be SPECIFIC: mention exact button text, form field name, or CSS selector."""
+{dom_context}
+{history_summary}
+
+{"What ONE action unblocks this? Consider: wrong selector, hidden element, unfilled required field, modal blocking, iframe content." if attempt == 1 else "DEEP ANALYZE: The agent failed multiple times. Why? Consider: hidden validation, React hydration, modal overlays, wrong element, disabled buttons that need enabling, iframe form fields, JavaScript event handlers."}
+
+RESPOND WITH:
+1. ROOT CAUSE: What specifically is blocking progress
+2. EXACT ACTION: The precise selector and action to take (e.g., "click button with text 'Continue'" or "fill input[name='phone'] with value")
+3. FALLBACK: If that doesn't work, what else to try"""
 
         response = client.models.generate_content(
             model="gemini-3-pro-preview",
@@ -1306,7 +1546,7 @@ Be SPECIFIC: mention exact button text, form field name, or CSS selector."""
             config={'temperature': 0.3, 'thinking_config': {'thinking_budget': thinking_budget}}
         )
         advice = response.text.strip() if response.text else "No response"
-        print(f"  [RESCUE ANALYSIS] Advice: {advice[:150]}")
+        print(f"  [RESCUE ANALYSIS] Advice: {advice[:200]}")
         return advice
 
     except Exception as e:
@@ -2047,6 +2287,18 @@ async def apply_to_job(job: dict) -> tuple[bool, str]:
     stuck = StuckDetector(window=3)
     all_agents = []  # Track all agents for history combining
 
+    def _total_steps() -> int:
+        """Total steps across all agents so far (for cost-aware decisions)."""
+        return sum(
+            len(ag.history.history) if ag.history and ag.history.history else 0
+            for _, ag in all_agents
+        )
+
+    # Cost-aware threshold: if we've already spent this many steps, don't de-escalate.
+    # At 60+ steps (~$0.30+), the context switch penalty ($0.01-0.02) isn't worth
+    # the savings — just let the expensive model finish.
+    DEEP_SESSION_THRESHOLD = 60
+
     agent = Agent(
         task=task,
         browser_session=browser,
@@ -2153,37 +2405,48 @@ or different form interaction methods. Focus on getting PAST the current blocker
                 print(f"  [SNAPSHOT] Post-bu-2-0: {post_bu2_state['path']} ({post_bu2_state['input_count']} inputs) → progress={progress}")
 
                 if progress:
-                    print(f"  [ORCHESTRATOR] bu-2-0 broke through blocker. DE-ESCALATING to bu-1-0 ({deesc_steps} steps)...")
-                    if _active_logger:
-                        _active_logger.log_step(agent.state.n_steps + 3, 'de_escalate', 'bu2_progress_detected')
+                    # Late-stage guard: review page or deep session = don't switch models
+                    steps_so_far = _total_steps()
+                    skip_deesc = False
+                    if post_bu2_state.get('is_review_page') and post_bu2_state.get('input_count', 99) <= 3:
+                        print(f"  [ORCHESTRATOR] bu-2-0 reached review page ({post_bu2_state.get('input_count', 0)} inputs). Skipping de-escalation.")
+                        skip_deesc = True
+                    elif steps_so_far >= DEEP_SESSION_THRESHOLD:
+                        print(f"  [ORCHESTRATOR] Deep session ({steps_so_far} steps already). Skipping de-escalation — not worth switching.")
+                        skip_deesc = True
 
-                    deesc_task = f"""Continue this job application. The browser is on the correct page.
-A previous agent got past the hard part — now complete the remaining form pages.
-Do NOT re-navigate. Fill fields, click Continue/Next, and submit.
+                    if not skip_deesc:
+                        print(f"  [ORCHESTRATOR] bu-2-0 broke through blocker. DE-ESCALATING to bu-1-0 ({deesc_steps} steps)...")
+                        if _active_logger:
+                            _active_logger.log_step(agent.state.n_steps + 3, 'de_escalate', 'bu2_progress_detected')
+
+                        # Context distillation: structured handoff instead of generic prompt
+                        handoff = build_handoff_context(pre_bu2_state, post_bu2_state, "bu-2-0")
+                        deesc_task = f"""{handoff}
 
 {task}"""
 
-                    stuck_deesc = StuckDetector(window=3)
-                    deesc_agent = Agent(
-                        task=deesc_task,
-                        # No llm= → defaults to bu-1-0 (cheap, $0.005/step)
-                        browser_session=browser,
-                        controller=controller,
-                        use_vision=True,
-                        available_file_paths=file_paths,
-                        max_failures=5,
-                        max_actions_per_step=5,
-                        max_steps=deesc_steps,
-                    )
-                    result = await deesc_agent.run(on_step_end=stuck_deesc.on_step_end)
-                    all_agents.append(('bu-1-0:deesc_after_bu2', deesc_agent))
+                        stuck_deesc = StuckDetector(window=3)
+                        deesc_agent = Agent(
+                            task=deesc_task,
+                            # No llm= → defaults to bu-1-0 (cheap, $0.005/step)
+                            browser_session=browser,
+                            controller=controller,
+                            use_vision=True,
+                            available_file_paths=file_paths,
+                            max_failures=5,
+                            max_actions_per_step=5,
+                            max_steps=deesc_steps,
+                        )
+                        result = await deesc_agent.run(on_step_end=stuck_deesc.on_step_end)
+                        all_agents.append(('bu-1-0:deesc_after_bu2', deesc_agent))
 
-                    # Anti-thrashing: if bu-1-0 gets stuck AGAIN, go straight to Gemini
-                    if not deesc_agent.history.is_done() and stuck_deesc.triggered:
-                        print(f"  [ORCHESTRATOR] De-escalated bu-1-0 stuck again ({stuck_deesc.trigger_reason}). → Gemini")
-                        if _active_logger:
-                            _active_logger.log_step(agent.state.n_steps + 4, 'deesc_stuck', stuck_deesc.trigger_reason)
-                        # Fall through to Phase 4 below
+                        # Anti-thrashing: if bu-1-0 gets stuck AGAIN, go straight to Gemini
+                        if not deesc_agent.history.is_done() and stuck_deesc.triggered:
+                            print(f"  [ORCHESTRATOR] De-escalated bu-1-0 stuck again ({stuck_deesc.trigger_reason}). → Gemini")
+                            if _active_logger:
+                                _active_logger.log_step(agent.state.n_steps + 4, 'deesc_stuck', stuck_deesc.trigger_reason)
+                            # Fall through to Phase 4 below
                 else:
                     # No progress detected — bu-2-0 used all steps without getting stuck
                     # but also didn't change the page. Treat as stuck → Phase 4.
@@ -2208,7 +2471,13 @@ Do NOT re-navigate. Fill fields, click Continue/Next, and submit.
                 # Snapshot BEFORE Gemini+bu-2-0 intervention
                 pre_gemini_state = await snapshot_browser_state(browser)
 
-                rescue_advice = await gemini_rescue_analysis(browser, task[:200], attempt=2)
+                # Collect history from all agents so Gemini sees what was tried
+                combined_history = []
+                for _, ag in all_agents:
+                    if ag.history and ag.history.history:
+                        combined_history.extend(ag.history.history)
+                rescue_advice = await gemini_rescue_analysis(
+                    browser, task[:200], attempt=2, agent_history=combined_history)
 
                 final_task = f"""Continue this job application. Multiple previous attempts have failed.
 
@@ -2241,24 +2510,36 @@ The browser is on the correct page. Fix the issue described above and complete t
                     print(f"  [SNAPSHOT] Post-Gemini: {post_gemini_state['path']} → progress={gemini_progress}")
 
                     if gemini_progress:
-                        print(f"  [ORCHESTRATOR] Gemini+bu-2-0 broke through. Final de-escalation to bu-1-0 ({deesc_steps} steps)...")
-                        stuck_final = StuckDetector(window=3)
-                        final_deesc = Agent(
-                            task=f"""Continue this job application. An expert analyzed the page and the agent broke through.
-Complete the remaining steps. Do NOT re-navigate.
+                        # Late-stage guard: review page or deep session = don't switch
+                        steps_so_far = _total_steps()
+                        skip_final_deesc = False
+                        if post_gemini_state.get('is_review_page') and post_gemini_state.get('input_count', 99) <= 3:
+                            print(f"  [ORCHESTRATOR] Gemini+bu-2-0 reached review page. Skipping final de-escalation.")
+                            skip_final_deesc = True
+                        elif steps_so_far >= DEEP_SESSION_THRESHOLD:
+                            print(f"  [ORCHESTRATOR] Deep session ({steps_so_far} steps). Skipping final de-escalation — finish with bu-2-0.")
+                            skip_final_deesc = True
+
+                        if not skip_final_deesc:
+                            print(f"  [ORCHESTRATOR] Gemini+bu-2-0 broke through. Final de-escalation to bu-1-0 ({deesc_steps} steps)...")
+                            # Context distillation: structured handoff
+                            handoff = build_handoff_context(pre_gemini_state, post_gemini_state, "Gemini+bu-2-0")
+                            stuck_final = StuckDetector(window=3)
+                            final_deesc = Agent(
+                                task=f"""{handoff}
 
 {task}""",
-                            # No llm= → defaults to bu-1-0 (cheap, $0.005/step)
-                            browser_session=browser,
-                            controller=controller,
-                            use_vision=True,
-                            available_file_paths=file_paths,
-                            max_failures=3,
-                            max_actions_per_step=5,
-                            max_steps=deesc_steps,
-                        )
-                        result = await final_deesc.run(on_step_end=stuck_final.on_step_end)
-                        all_agents.append(('bu-1-0:final_deesc', final_deesc))
+                                # No llm= → defaults to bu-1-0 (cheap, $0.005/step)
+                                browser_session=browser,
+                                controller=controller,
+                                use_vision=True,
+                                available_file_paths=file_paths,
+                                max_failures=3,
+                                max_actions_per_step=5,
+                                max_steps=deesc_steps,
+                            )
+                            result = await final_deesc.run(on_step_end=stuck_final.on_step_end)
+                            all_agents.append(('bu-1-0:final_deesc', final_deesc))
 
         # Log pipeline completion
         if _active_logger and len(all_agents) > 1:

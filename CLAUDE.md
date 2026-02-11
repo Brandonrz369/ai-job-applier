@@ -132,16 +132,23 @@ Phase 1: bu-1-0 (40 steps Indeed / 50 steps External)
 Phase 2: bu-1-0 nudge (10/15 steps, fresh prompt)
     ↓ still not done?
 Phase 3: bu-2-0 Blocker-Buster (10 steps, 3x cost)
-    ├── PROGRESS → DE-ESCALATE to bu-1-0 (15 steps)
-    │   └── stuck again? → Phase 4 (no ping-pong)
-    └── STUCK → Phase 4
-Phase 4: Gemini 3 Pro advisory + bu-2-0 (10 steps)
-    └── PROGRESS → DE-ESCALATE to bu-1-0 (15 steps)
+    ├── REVIEW PAGE or DEEP SESSION (60+ steps) → let bu-2-0 finish
+    ├── PROGRESS → DE-ESCALATE to bu-1-0 (15 steps, context distillation handoff)
+    │   └── stuck again? → Phase 4 (anti-thrashing, no ping-pong)
+    └── STUCK / NO PROGRESS → Phase 4
+Phase 4: Gemini 3 Pro advisory (full DOM + agent history) + bu-2-0 (10 steps)
+    ├── REVIEW PAGE or DEEP SESSION → let bu-2-0 finish
+    └── PROGRESS → DE-ESCALATE to bu-1-0 (15 steps, context distillation handoff)
 ```
 
-- Stuck detection: URL+action fingerprinting via on_step_end hook (window=3)
-- De-escalation trigger: bu-2-0 not stuck AND not done → hand back to bu-1-0
-- Anti-thrashing: bu-1-0 after de-escalation gets ONE chance
+### Smart De-escalation Features
+- **Stuck detection**: URL+action fingerprinting via on_step_end hook (window=3)
+- **Progress detection**: URL path + hash fragment + page title + form fill % + button text changes
+- **Context distillation**: Structured handoff (URL, form state, buttons, errors) instead of generic prompt
+- **Late-stage guard**: Review/submit page with <=3 inputs → skip de-escalation, let expensive model finish
+- **Cost-aware guard**: 60+ total steps → skip de-escalation (context switch cost > savings)
+- **Anti-thrashing**: bu-1-0 after de-escalation gets ONE chance; stuck again → Gemini
+- **Gemini rescue**: Full interactive DOM tree + iframe content + agent step history (not just screenshot)
 - Expected cost: ~$0.02/app average, ~$0.08 worst case
 
 ## Rate Limiting
